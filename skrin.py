@@ -12,7 +12,7 @@ from functools import lru_cache
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener Ultra v4.1",
+    page_title="Quant Trader - IDX Screener Ultra v4.2",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -48,6 +48,32 @@ st.markdown("""
     .ind-neut { background:rgba(139,148,158,.12);color:#8b949e; border:1px solid rgba(139,148,158,.3);}
     .rr-badge  { font-size:0.75rem; font-weight:700; color:#d2a8ff; }
     .audit-box { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:0.8rem; margin-top:0.5rem; font-size:0.75rem; color:#8b949e; }
+
+    /* Volume Context Bar */
+    .vol-ctx { background:rgba(255,255,255,0.03); border-radius:6px; padding:0.4rem 0.6rem; margin-bottom:0.5rem; border:1px solid #21262d; }
+    .vol-bar-track { background:#21262d; border-radius:4px; height:5px; width:100%; margin-top:0.25rem; }
+    .vol-bar-fill  { height:5px; border-radius:4px; transition:width 0.3s; }
+
+    /* Tape Reading & Bandarmology */
+    .section-divider { border-top:1px solid #21262d; margin:0.5rem 0 0.4rem; }
+    .tape-pill {
+        display:inline-block; font-size:0.65rem; font-weight:700; padding:0.12rem 0.4rem;
+        border-radius:8px; margin:0.08rem 0.06rem;
+    }
+    .tape-accum   { background:rgba(63,185,80,.18);  color:#3fb950; border:1px solid rgba(63,185,80,.35); }
+    .tape-distrib { background:rgba(248,81,73,.18);  color:#f85149; border:1px solid rgba(248,81,73,.35); }
+    .tape-neutral { background:rgba(139,148,158,.12);color:#8b949e; border:1px solid rgba(139,148,158,.3);}
+    .tape-warn    { background:rgba(219,109,40,.18); color:#db6d28; border:1px solid rgba(219,109,40,.35);}
+    .tape-purple  { background:rgba(188,140,255,.15);color:#bc8cff; border:1px solid rgba(188,140,255,.3);}
+
+    /* Confidence badge */
+    .conf-hi  { color:#3fb950; font-weight:800; font-size:0.65rem; }
+    .conf-med { color:#e3b341; font-weight:800; font-size:0.65rem; }
+    .conf-lo  { color:#8b949e; font-weight:700; font-size:0.65rem; }
+
+    /* Narasi box */
+    .narasi-tech  { font-size:0.72rem; color:#c9d1d9; font-style:italic; line-height:1.35; }
+    .narasi-plain { font-size:0.7rem;  color:#8b949e; line-height:1.3; margin-top:0.15rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -231,6 +257,321 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
         'vol_spike':       vol_spike,
         'adtv':            adtv,
     }
+
+# =============================================================================
+# 4b. VOLUME CONTEXT — analisis candle terakhir
+# =============================================================================
+def analyse_volume_context(df: pd.DataFrame) -> dict:
+    """
+    Analisis candle hari ini vs rata-rata:
+    - Arah candle (bullish/bearish/doji)
+    - Volume spike ratio vs MA-20
+    - Body size (%) vs full range
+    - Upper/lower shadow dominance
+    Adaptif: bekerja sama di 1d (swing) maupun 60m (intraday).
+    """
+    if len(df) < 5:
+        return {'valid': False}
+
+    row   = df.iloc[-1]
+    o, h, l, c = float(row['Open']), float(row['High']), float(row['Low']), float(row['Close'])
+    vol   = float(row['Volume'])
+    rng   = h - l if h > l else 1e-9
+
+    body      = abs(c - o)
+    body_pct  = body / rng            # 0–1, besar = candle tegas
+    upper_sh  = h - max(c, o)
+    lower_sh  = min(c, o) - l
+    close_pos = (c - l) / rng        # 0 = tutup di bawah, 1 = tutup di atas
+
+    vol_ma20  = float(df['Volume'].rolling(20).mean().iloc[-1])
+    vol_ratio = vol / max(vol_ma20, 1.0)
+
+    if body_pct < 0.15:
+        candle_dir = "doji"
+    elif c >= o:
+        candle_dir = "bullish"
+    else:
+        candle_dir = "bearish"
+
+    return {
+        'valid':       True,
+        'candle_dir':  candle_dir,
+        'body_pct':    round(body_pct, 3),
+        'upper_sh':    round(upper_sh / rng, 3),
+        'lower_sh':    round(lower_sh / rng, 3),
+        'close_pos':   round(close_pos, 3),
+        'vol_ratio':   round(vol_ratio, 2),
+        'vol_ma20':    vol_ma20,
+    }
+
+
+# =============================================================================
+# 4c. TAPE READING — pola 5 candle terakhir
+# =============================================================================
+def analyse_tape(df: pd.DataFrame) -> dict:
+    """
+    Deteksi pola price-volume 5 candle terakhir:
+    - Buying/Selling Climax
+    - Absorption
+    - Exhaustion
+    - Accumulation Quiet
+    Kembalikan list sinyal aktif + sinyal terkuat.
+    """
+    if len(df) < 10:
+        return {'signals': [], 'dominant': None}
+
+    tail   = df.tail(5).copy()
+    vol5   = tail['Volume'].values.astype(float)
+    hi5    = tail['High'].values.astype(float)
+    lo5    = tail['Low'].values.astype(float)
+    op5    = tail['Open'].values.astype(float)
+    cl5    = tail['Close'].values.astype(float)
+
+    vol_ma = float(df['Volume'].rolling(20).mean().iloc[-1])
+    atr5   = float(calculate_atr(df.tail(20)).iloc[-1])
+
+    ranges5     = hi5 - lo5
+    avg_range5  = float(np.mean(ranges5)) if np.mean(ranges5) > 0 else 1e-9
+    avg_vol5    = float(np.mean(vol5))
+    avg_vol5_s  = max(avg_vol5, 1.0)
+
+    signals = []
+
+    # ── Buying Climax: volume sangat tinggi + candle bullish besar di puncak ──
+    last_vol_ratio = vol5[-1] / max(vol_ma, 1.0)
+    last_range     = ranges5[-1]
+    last_body      = abs(cl5[-1] - op5[-1])
+    last_close_pos = (cl5[-1] - lo5[-1]) / max(last_range, 1e-9)
+
+    if (last_vol_ratio > 2.5 and last_body / max(last_range, 1e-9) > 0.6
+            and cl5[-1] > op5[-1] and last_close_pos > 0.7):
+        signals.append(('buying_climax', 'distrib',
+                        'Buying Climax', 'BC',
+                        min(int(last_vol_ratio / 3.0 * 100), 90)))
+
+    # ── Selling Climax: volume sangat tinggi + bearish besar ──
+    if (last_vol_ratio > 2.5 and last_body / max(last_range, 1e-9) > 0.6
+            and cl5[-1] < op5[-1] and last_close_pos < 0.3):
+        signals.append(('selling_climax', 'accum',
+                        'Selling Climax', 'SC',
+                        min(int(last_vol_ratio / 3.0 * 100), 90)))
+
+    # ── Absorption: volume besar tapi harga tidak turun jauh (close_pos tinggi) ──
+    if (last_vol_ratio > 1.8 and last_close_pos > 0.55
+            and abs(cl5[-1] - cl5[-2]) / max(atr5, 1e-9) < 0.5):
+        signals.append(('absorption', 'accum',
+                        'Absorption', 'ABS',
+                        min(int(last_close_pos * last_vol_ratio / 2.5 * 100), 85)))
+
+    # ── Exhaustion: volume tinggi tapi range candle kecil ──
+    if (last_vol_ratio > 1.8 and last_range < avg_range5 * 0.6):
+        signals.append(('exhaustion', 'warn',
+                        'Exhaustion', 'EXH',
+                        min(int((avg_range5 / max(last_range, 1e-9)) * 20), 80)))
+
+    # ── Accumulation Quiet: 5 candle volume rendah konsisten, harga tidak turun ──
+    vol_consistent_low = all(v < vol_ma * 0.8 for v in vol5)
+    price_stable       = (max(cl5) - min(cl5)) / max(atr5, 1e-9) < 1.5
+    if vol_consistent_low and price_stable:
+        signals.append(('accum_quiet', 'accum',
+                        'Akumulasi Senyap', 'AQ',
+                        72))
+
+    dominant = signals[0] if signals else None
+    return {'signals': signals, 'dominant': dominant}
+
+
+# =============================================================================
+# 4d. BANDARMOLOGY — deteksi aksi smart money
+# =============================================================================
+def analyse_bandarmology(df: pd.DataFrame) -> dict:
+    """
+    Deteksi pola OHLCV khas smart money:
+    1. Accumulation Signal    — turun tapi close upper-half + vol di atas rata
+    2. Distribution Signal    — naik tapi close lower-half + vol spike
+    3. Stealth Accumulation   — sideways ketat + vol sedikit di atas normal
+    4. Markup Phase           — gap up + volume besar setelah akumulasi
+    5. Shakeout               — spike turun tajam 1 candle lalu langsung recovery
+
+    Kembalikan list sinyal dengan confidence level (high/med/low).
+    Dua level: high ≥ 75, med ≥ 50.
+    """
+    if len(df) < 20:
+        return {'signals': [], 'dominant': None, 'narasi': ('', '')}
+
+    vol_ma    = float(df['Volume'].rolling(20).mean().iloc[-1])
+    atr_val   = float(calculate_atr(df.tail(30)).iloc[-1])
+    close     = df['Close'].values.astype(float)
+    high_arr  = df['High'].values.astype(float)
+    low_arr   = df['Low'].values.astype(float)
+    open_arr  = df['Open'].values.astype(float)
+    vol_arr   = df['Volume'].values.astype(float)
+
+    def _close_pos(i):
+        rng = high_arr[i] - low_arr[i]
+        return (close[i] - low_arr[i]) / max(rng, 1e-9)
+
+    def _vol_ratio(i):
+        return vol_arr[i] / max(vol_ma, 1.0)
+
+    def _conf_label(pct: int) -> str:
+        if pct >= 75: return 'high'
+        if pct >= 50: return 'med'
+        return 'low'
+
+    signals = []
+    n = len(df)
+    last = n - 1
+
+    # 1. Accumulation Signal (lihat 3 candle terakhir)
+    for i in range(max(0, n-3), n):
+        if (close[i] < close[i-1]                # harga turun
+                and _close_pos(i) > 0.55         # tutup di atas setengah
+                and _vol_ratio(i) > 1.4):        # volume di atas rata
+            cp  = _close_pos(i)
+            vr  = _vol_ratio(i)
+            conf = int(min((cp - 0.55)/0.45 * 50 + (vr - 1.4)/1.6 * 50, 95))
+            signals.append({
+                'key': 'accum_signal', 'style': 'accum',
+                'label': 'Akumulasi', 'short': 'ACCU',
+                'conf_pct': conf, 'conf': _conf_label(conf),
+                'candle_idx': i,
+            })
+            break
+
+    # 2. Distribution Signal
+    for i in range(max(0, n-3), n):
+        if (close[i] > close[i-1]
+                and _close_pos(i) < 0.45
+                and _vol_ratio(i) > 1.8):
+            cp  = 1 - _close_pos(i)
+            vr  = _vol_ratio(i)
+            conf = int(min((cp - 0.55)/0.45 * 50 + (vr - 1.8)/2.2 * 50, 95))
+            signals.append({
+                'key': 'distrib_signal', 'style': 'distrib',
+                'label': 'Distribusi', 'short': 'DIST',
+                'conf_pct': conf, 'conf': _conf_label(conf),
+                'candle_idx': i,
+            })
+            break
+
+    # 3. Stealth Accumulation — 5 candle terakhir
+    tail5_vol   = vol_arr[-5:]
+    tail5_close = close[-5:]
+    vol_slightly_above = np.mean(tail5_vol) > vol_ma * 1.05 and np.mean(tail5_vol) < vol_ma * 1.5
+    price_range_tight  = (max(tail5_close) - min(tail5_close)) / max(atr_val, 1e-9) < 1.2
+    if vol_slightly_above and price_range_tight:
+        conf = 68
+        signals.append({
+            'key': 'stealth_accum', 'style': 'accum',
+            'label': 'Akum. Senyap', 'short': 'STL',
+            'conf_pct': conf, 'conf': _conf_label(conf),
+            'candle_idx': last,
+        })
+
+    # 4. Markup Phase — gap up + volume besar setelah 5 hari sideways
+    if n >= 7:
+        gap_up    = open_arr[last] > close[-2] * 1.005
+        big_vol   = _vol_ratio(last) > 2.0
+        was_sideways = (max(close[-7:-2]) - min(close[-7:-2])) / max(atr_val, 1e-9) < 2.0
+        if gap_up and big_vol and was_sideways:
+            vr   = _vol_ratio(last)
+            conf = int(min(60 + (vr - 2.0)/3.0 * 35, 95))
+            signals.append({
+                'key': 'markup', 'style': 'purple',
+                'label': 'Markup Phase', 'short': 'MRK',
+                'conf_pct': conf, 'conf': _conf_label(conf),
+                'candle_idx': last,
+            })
+
+    # 5. Shakeout — spike turun tajam lalu langsung recovery hari ini
+    if n >= 3:
+        prev_drop   = close[-2] - close[-3]   # drop candle kemarin
+        today_recov = close[-1] - close[-2]   # recovery hari ini
+        drop_size   = abs(prev_drop) / max(atr_val, 1e-9)
+        if (prev_drop < 0
+                and drop_size > 1.5
+                and today_recov > abs(prev_drop) * 0.6
+                and _vol_ratio(last-1) > 1.5):
+            conf = int(min(55 + drop_size * 8, 88))
+            signals.append({
+                'key': 'shakeout', 'style': 'warn',
+                'label': 'Shakeout', 'short': 'SKO',
+                'conf_pct': conf, 'conf': _conf_label(conf),
+                'candle_idx': last,
+            })
+
+    # Urutkan confidence tertinggi di depan
+    signals.sort(key=lambda x: x['conf_pct'], reverse=True)
+    dominant = signals[0] if signals else None
+
+    # Narasi dua baris
+    narasi_tech, narasi_plain = _build_narasi(signals, dominant)
+
+    return {
+        'signals':     signals,
+        'dominant':    dominant,
+        'narasi_tech': narasi_tech,
+        'narasi_plain': narasi_plain,
+    }
+
+
+def _build_narasi(signals: list, dominant: dict | None) -> tuple[str, str]:
+    """Bangun narasi teknikal + plain dari sinyal dominant."""
+    if dominant is None:
+        return "Tidak ada sinyal price-action signifikan.", \
+               "Belum ada pola yang cukup kuat untuk dibaca."
+
+    key = dominant['key']
+    conf = dominant['conf_pct']
+
+    narasi_map = {
+        'accum_signal': (
+            f"Candle turun namun close di upper-half dengan volume {conf}% di atas rata — indikasi penyerapan.",
+            "Harga turun tapi ada yang beli kuat di bawah. Kemungkinan bandar sedang akumulasi."
+        ),
+        'distrib_signal': (
+            f"Candle naik namun close di lower-half + volume spike — pola distribusi institusional.",
+            "Harga naik tapi bandar tampak buang saham ke ritel. Hati-hati jebakan kenaikan."
+        ),
+        'stealth_accum': (
+            "Volume 5 candle sedikit di atas normal, harga bergerak sideways ketat — akumulasi bertahap.",
+            "Saham diam-diam dibeli dalam jumlah kecil. Biasanya tanda akan ada pergerakan besar."
+        ),
+        'markup': (
+            f"Gap-up + volume >{conf//10*10}% di atas rata setelah fase sideways — markup phase terdeteksi.",
+            "Bandar mulai dorong harga setelah akumulasi selesai. Ini sinyal awal kenaikan besar."
+        ),
+        'shakeout': (
+            "Drop tajam 1 candle diikuti recovery kuat hari ini — pola shakeout sebelum naik.",
+            "Kemarin turun tajam tapi hari ini langsung balik. Ini cara bandar buang holder lemah."
+        ),
+        'buying_climax': (
+            "Volume ekstrem + candle bullish besar di level atas — potensi buying climax.",
+            "Semua orang beli sekarang, tapi ini justru saat bandar mulai jual. Waspada balik arah."
+        ),
+        'selling_climax': (
+            "Volume ekstrem + candle bearish besar — selling climax, potensi reversal naik.",
+            "Semua orang panik jual. Ini biasanya momen bandar masuk beli murah."
+        ),
+        'absorption': (
+            "Volume besar namun harga tidak turun signifikan — demand menyerap supply.",
+            "Ada yang beli besar dan menahan harga agar tidak jatuh. Tanda akumulasi aktif."
+        ),
+        'exhaustion': (
+            "Volume tinggi tapi range candle kecil — tenaga gerak mulai habis.",
+            "Banyak yang trading tapi harga nggak kemana-mana. Pergerakan besar mungkin sudah hampir habis."
+        ),
+        'accum_quiet': (
+            "5 candle volume rendah konsisten, harga tidak turun — akumulasi senyap (quiet period).",
+            "Tidak ada yang buang saham ini. Bandar sedang diam-diam mengumpulkan."
+        ),
+    }
+
+    tech, plain = narasi_map.get(key, ("Sinyal tidak dikenali.", "Pola belum terdefinisi."))
+    return tech, plain
+
 
 # =============================================================================
 # 5. SCORING ENGINE (5 KOMPONEN BERBOBOT)
@@ -556,6 +897,11 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         else:
             grade = "C"
 
+        # ── Analisis tambahan (tidak mempengaruhi score) ───────────────────
+        vol_ctx  = analyse_volume_context(df)
+        tape     = analyse_tape(df)
+        bandar   = analyse_bandarmology(df)
+
         plan = build_trade_plan(last_close, ind['atr_val'], mode_params)
         stop_loss = plan['stop_loss']
         tp1       = plan['tp1']
@@ -609,6 +955,9 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             "Lots":         int(calc_lots),
             "Alokasi (Rp)": required_cap,
             "_breakdown":   breakdown,
+            "_vol_ctx":     vol_ctx,
+            "_tape":        tape,
+            "_bandar":      bandar,
         })
 
     # Simpan summary ke session state untuk debug view
@@ -642,6 +991,107 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
 # =============================================================================
 def _pill(label: str, signal: str) -> str:
     return f'<span class="ind-pill ind-{signal}">{label}</span>'
+
+def _tape_pill(short: str, style: str, conf_pct: int) -> str:
+    return f'<span class="tape-pill tape-{style}">{short} {conf_pct}%</span>'
+
+def _conf_badge(conf: str) -> str:
+    cls = {'high': 'conf-hi', 'med': 'conf-med', 'low': 'conf-lo'}.get(conf, 'conf-lo')
+    label = {'high': '▲ Tinggi', 'med': '◆ Sedang', 'low': '● Rendah'}.get(conf, '—')
+    return f'<span class="{cls}">{label}</span>'
+
+def _render_volume_ctx_html(vc: dict) -> str:
+    """Volume Context Bar — arah candle, vol ratio, body size."""
+    if not vc.get('valid'):
+        return ''
+
+    dir_color = {'bullish': '#3fb950', 'bearish': '#f85149', 'doji': '#8b949e'}.get(vc['candle_dir'], '#8b949e')
+    dir_icon  = {'bullish': '▲', 'bearish': '▼', 'doji': '—'}.get(vc['candle_dir'], '—')
+    dir_label = {'bullish': 'Bullish', 'bearish': 'Bearish', 'doji': 'Doji'}.get(vc['candle_dir'], '—')
+
+    vr = vc['vol_ratio']
+    if vr >= 2.0:
+        bar_color, vol_label = '#3fb950', f'{vr:.1f}× vol (spike)'
+    elif vr >= 1.3:
+        bar_color, vol_label = '#e3b341', f'{vr:.1f}× vol (atas rata)'
+    elif vr >= 0.7:
+        bar_color, vol_label = '#8b949e', f'{vr:.1f}× vol (normal)'
+    else:
+        bar_color, vol_label = '#f85149', f'{vr:.1f}× vol (sepi)'
+
+    bar_width = min(int(vr / 3.0 * 100), 100)
+    body_pct  = int(vc['body_pct'] * 100)
+    close_pct = int(vc['close_pos'] * 100)
+
+    return (
+        f'<div class="vol-ctx">'
+        f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+        f'  <span style="font-size:0.68rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px;">Volume Konteks</span>'
+        f'  <span style="font-size:0.72rem;font-weight:700;color:{dir_color};">{dir_icon} {dir_label}</span>'
+        f'</div>'
+        f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0.3rem;margin-top:0.25rem;">'
+        f'  <div><div style="font-size:0.6rem;color:#8b949e;">Vol vs MA</div>'
+        f'  <div style="font-size:0.7rem;font-weight:700;color:{bar_color};">{vol_label}</div></div>'
+        f'  <div><div style="font-size:0.6rem;color:#8b949e;">Body Size</div>'
+        f'  <div style="font-size:0.7rem;font-weight:700;color:#c9d1d9;">{body_pct}% range</div></div>'
+        f'  <div><div style="font-size:0.6rem;color:#8b949e;">Close Pos</div>'
+        f'  <div style="font-size:0.7rem;font-weight:700;color:#c9d1d9;">{close_pct}% hi-lo</div></div>'
+        f'</div>'
+        f'<div class="vol-bar-track"><div class="vol-bar-fill" style="width:{bar_width}%;background:{bar_color};"></div></div>'
+        f'</div>'
+    )
+
+def _render_tape_bandar_html(tape: dict, bandar: dict) -> str:
+    """Tape pills + Bandar pills + Confidence + Narasi dua baris."""
+    parts = []
+
+    # ── Tape Reading pills ─────────────────────────────────────────────────
+    tape_sigs = tape.get('signals', [])
+    if tape_sigs:
+        pills_html = ''.join(
+            _tape_pill(s[3], s[1], s[4]) for s in tape_sigs[:4]
+        )
+        parts.append(
+            f'<div style="margin-bottom:0.25rem;">'
+            f'<span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px;margin-right:0.3rem;">Tape</span>'
+            f'{pills_html}</div>'
+        )
+
+    # ── Bandarmology pills ────────────────────────────────────────────────
+    bandar_sigs = bandar.get('signals', [])
+    if bandar_sigs:
+        pills_html = ''.join(
+            _tape_pill(s['short'], s['style'], s['conf_pct']) for s in bandar_sigs[:3]
+        )
+        dominant = bandar.get('dominant')
+        conf_badge = _conf_badge(dominant['conf']) if dominant else ''
+        parts.append(
+            f'<div style="display:flex;align-items:center;gap:0.3rem;flex-wrap:wrap;margin-bottom:0.25rem;">'
+            f'<span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px;">Bandar</span>'
+            f'{pills_html}{conf_badge}</div>'
+        )
+
+    # ── Narasi ────────────────────────────────────────────────────────────
+    narasi_tech  = bandar.get('narasi_tech', '')
+    narasi_plain = bandar.get('narasi_plain', '')
+    if narasi_tech:
+        parts.append(
+            f'<div style="background:rgba(255,255,255,0.02);border-left:2px solid #30363d;'
+            f'padding:0.3rem 0.5rem;border-radius:0 4px 4px 0;">'
+            f'<div class="narasi-tech">"{narasi_tech}"</div>'
+            f'<div class="narasi-plain">→ {narasi_plain}</div>'
+            f'</div>'
+        )
+
+    if not parts:
+        return ''
+
+    return (
+        f'<div class="section-divider"></div>'
+        f'<div style="margin-bottom:0.4rem;">'
+        + ''.join(parts) +
+        f'</div>'
+    )
 
 def _grade_badge(grade: str) -> str:
     cls = {"A": "grade-A", "B": "grade-B", "C": "grade-C"}.get(grade, "grade-C")
@@ -705,7 +1155,10 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
         cols  = st.columns(len(batch))
         for j, (_, row) in enumerate(batch.iterrows()):
             with cols[j]:
-                bd = row.get("_breakdown", {})
+                bd      = row.get("_breakdown", {})
+                vol_ctx = row.get("_vol_ctx", {})
+                tape    = row.get("_tape", {})
+                bandar  = row.get("_bandar", {})
 
                 # FIX #17: pill_from_bd didefinisikan di dalam loop → closure bug di Python.
                 # Pindahkan ke luar sebagai lambda dengan default arg.
@@ -723,6 +1176,9 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
                     + pill_from_bd("squeeze","SQZ")
                 )
 
+                vol_ctx_html    = _render_volume_ctx_html(vol_ctx)
+                tape_bandar_html = _render_tape_bandar_html(tape, bandar)
+
                 html = (
                     f'<div class="metric-card">'
                     f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.3rem;">'
@@ -733,6 +1189,7 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
                     f'  </div>'
                     f'</div>'
                     f'<div style="margin-bottom:0.5rem;">{pills_html}</div>'
+                    f'{vol_ctx_html}'
                     f'{_price_status_html(row["Live Price"], row["Last Price"], row["Buy Min"], row["Buy Max"], row["Live Src"])}'
                     f'<div class="price-range">{int(row["Buy Min"])} – {int(row["Buy Max"])}</div>'
                     f'<div class="label" style="margin-bottom:0.6rem;">Area Rentang Buy · ATR {row["ATR"]}</div>'
@@ -756,6 +1213,7 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
                     f'  <div><div class="label">Maks Alokasi</div>'
                     f'  <div style="color:#58a6ff;font-weight:600">{fmt_idr(row["Alokasi (Rp)"])}</div></div>'
                     f'</div>'
+                    f'{tape_bandar_html}'
                     f'</div>'
                 )
                 st.markdown(html, unsafe_allow_html=True)
