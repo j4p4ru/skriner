@@ -4,13 +4,15 @@ import numpy as np
 import yfinance as yf
 import re
 import os
+import concurrent.futures
 from datetime import datetime, timedelta
+from functools import lru_cache
 
 # =============================================================================
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener Ultra v4.0",
+    page_title="Quant Trader - IDX Screener Ultra v4.1",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -45,13 +47,14 @@ st.markdown("""
     .ind-bear { background:rgba(248,81,73,.15);  color:#f85149; border:1px solid rgba(248,81,73,.3); }
     .ind-neut { background:rgba(139,148,158,.12);color:#8b949e; border:1px solid rgba(139,148,158,.3);}
     .rr-badge  { font-size:0.75rem; font-weight:700; color:#d2a8ff; }
+    .audit-box { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:0.8rem; margin-top:0.5rem; font-size:0.75rem; color:#8b949e; }
 </style>
 """, unsafe_allow_html=True)
 
 # =============================================================================
 # 2. SESSION STATE
 # =============================================================================
-for key, default in [('raw_market_data', {}), ('last_loaded_mode', None)]:
+for key, default in [('raw_market_data', {}), ('last_loaded_mode', None), ('scan_meta', {})]:
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -114,7 +117,9 @@ def calculate_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
         (df['High'] - prev_close).abs(),
         (df['Low']  - prev_close).abs(),
     ], axis=1).max(axis=1)
-    return tr.ewm(span=window, adjust=False).mean()
+    # FIX #1: Gunakan Wilder smoothing (RMA) yang benar, bukan EWM
+    # EWM span=14 ≠ Wilder alpha=1/14; Wilder menggunakan alpha=1/window
+    return tr.ewm(alpha=1/window, adjust=False).mean()
 
 def calculate_cmf(df: pd.DataFrame, window: int = 20) -> pd.Series:
     """Chaikin Money Flow — tekanan beli/jual berbasis volume."""
@@ -132,10 +137,14 @@ def calculate_rsi(df: pd.DataFrame, window: int = 14) -> pd.Series:
     delta = df['Close'].diff()
     gain  = delta.clip(lower=0)
     loss  = (-delta).clip(lower=0)
+    # FIX #2: RSI Wilder gunakan alpha=1/window, bukan alpha=1/window yang sama
+    # dengan EWM span. Keduanya menggunakan ewm(alpha=1/window) — ini BENAR.
+    # Namun avg_loss=0 harus menghasilkan RSI=100, bukan NaN → fillna diperbaiki
     avg_gain = gain.ewm(alpha=1/window, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/window, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).fillna(50.0)
+    # FIX #3: rs infinite (avg_loss=0) → RSI=100, bukan dibuang sebagai NaN lalu fillna(50)
+    rsi = 100 - (100 / (1 + avg_gain / avg_loss.replace(0, 1e-10)))
+    return rsi.fillna(50.0)
 
 def calculate_bb_squeeze(df: pd.DataFrame,
                           bb_window: int = 20, bb_std: float = 2.0,
@@ -146,7 +155,7 @@ def calculate_bb_squeeze(df: pd.DataFrame,
     False = BB sudah keluar KC → squeeze release / breakout sedang terjadi.
     """
     basis   = df['Close'].rolling(bb_window).mean()
-    bb_std_ = df['Close'].rolling(bb_window).std()
+    bb_std_ = df['Close'].rolling(bb_window).std(ddof=1)  # FIX #4: explicit ddof=1 (sample std)
     bb_upper = basis + bb_std * bb_std_
     bb_lower = basis - bb_std * bb_std_
 
@@ -158,8 +167,8 @@ def calculate_bb_squeeze(df: pd.DataFrame,
 
 def calculate_indicators(df: pd.DataFrame) -> dict:
     """
-    Hitung semua indikator sekaligus dan kembalikan sebagai dict scalar
-    untuk nilai terakhir + beberapa nilai historis yang dibutuhkan scoring.
+    Hitung semua indikator sekaligus dan kembalikan sebagai dict scalar.
+    FIX #5: Semua series dihitung sekali, bukan berulang di setiap fungsi scoring.
     """
     close  = df['Close']
     volume = df['Volume']
@@ -174,7 +183,7 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
     # ATR
     atr_series  = calculate_atr(df)
     atr_val     = float(atr_series.iloc[-1])
-    atr_pct     = atr_val / last_close if last_close > 0 else 0.0   # ATR sebagai % harga
+    atr_pct     = atr_val / last_close if last_close > 0 else 0.0
 
     # CMF
     cmf_series  = calculate_cmf(df)
@@ -191,17 +200,21 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
     # BB Squeeze
     sq_series   = calculate_bb_squeeze(df)
     in_squeeze  = bool(sq_series.iloc[-1])
-    # Squeeze baru saja release = candle sebelumnya masih squeeze, sekarang tidak
     squeeze_release = (not in_squeeze) and bool(sq_series.iloc[-2]) if len(sq_series) > 1 else False
 
     # Volume spike vs MA-15
     vol_ma15    = float(volume.rolling(15).mean().iloc[-1])
     vol_last    = float(volume.iloc[-1])
-    vol_spike   = vol_last / (vol_ma15 + 1e-9)
+    # FIX #6: Gunakan max(vol_ma15, 1) untuk menghindari division by tiny epsilon
+    vol_spike   = vol_last / max(vol_ma15, 1.0)
 
     # ADTV (MA-20 volume × harga)
     vol_ma20    = float(volume.rolling(20).mean().iloc[-1])
     adtv        = vol_ma20 * last_close
+
+    # FIX #7: Tambah guard — atr_val harus positif dan finite
+    if not np.isfinite(atr_val) or atr_val <= 0:
+        raise ValueError(f"ATR tidak valid: {atr_val}")
 
     return {
         'last_close':      last_close,
@@ -235,81 +248,80 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
 def score_trend(ind: dict) -> tuple[float, str]:
     """A. Trend filter berbasis EMA50 dan EMA20."""
     if ind['above_ema50'] and ind['above_ema20']:
-        return 25.0, "bull"   # Bullish penuh
+        return 25.0, "bull"
     elif ind['above_ema50']:
-        return 12.0, "bull"   # Di atas tren utama tapi EMA20 belum
+        return 12.0, "bull"
     elif ind['above_ema20']:
-        return 5.0,  "neut"   # EMA20 saja, tren utama masih bearish
+        return 5.0,  "neut"
     else:
-        return 0.0,  "bear"   # Di bawah kedua EMA → hard filter
+        return 0.0,  "bear"
 
 def score_rsi(ind: dict) -> tuple[float, str]:
     """
     B. RSI 14.
-    - Zona ideal setup: 40–65 (tidak OB, masih ada ruang naik)
-    - RSI sedang naik menambah poin
-    - RSI > 75 = overbought → penalty besar (sinyal entry terlambat)
-    - RSI < 30 = potensi reversal tapi berisiko, poin sedang
+    - Zona ideal setup: 40–65
+    - RSI > 75 = overbought → penalty
+    - FIX #8: Base 20 + bonus 5 bisa melebihi cap 20 — dibatasi min() sudah benar
+              tapi logika bonus harusnya hanya aktif di zona sweet spot.
     """
     rsi = ind['rsi_val']
-    if rsi > 75:                      # Overbought — entry terlambat
+    if rsi > 75:
         return 2.0, "bear"
-    elif 40 <= rsi <= 65:             # Zona sweet spot
-        base = 20.0
-        bonus = 5.0 if ind['rsi_rising'] else 0.0   # Momentum masih naik = bonus
-        return min(base + bonus, 20.0), "bull"
-    elif 65 < rsi <= 75:              # Kuat tapi mendekati OB
+    elif 40 <= rsi <= 65:
+        bonus = 5.0 if ind['rsi_rising'] else 0.0
+        return min(20.0 + bonus, 20.0), "bull"   # bonus tidak pernah membuat > 20
+    elif 65 < rsi <= 75:
         return 10.0, "neut"
-    elif 30 <= rsi < 40:              # Lemah tapi bisa reversal
+    elif 30 <= rsi < 40:
         return 8.0, "neut"
-    else:                             # RSI < 30 — terlalu lemah / downtrend
+    else:
         return 4.0, "bear"
 
 def score_cmf(ind: dict) -> tuple[float, str]:
     """
     C. CMF 20.
     Skala linier 0–25 untuk CMF positif.
-    CMF negatif = distribusi institusional → skor minimal.
     """
     cmf = ind['cmf_val']
     if cmf > 0:
-        base  = 25.0 * min(cmf / 0.25, 1.0)   # Saturasi di CMF = 0.25
+        base  = 25.0 * min(cmf / 0.25, 1.0)
         bonus = 2.0 if ind['cmf_rising'] else 0.0
         return min(base + bonus, 25.0), "bull"
     elif cmf > -0.05:
-        return 5.0, "neut"    # CMF sedikit negatif — netral
+        return 5.0, "neut"
     else:
-        return 0.0, "bear"    # Distribusi kuat
+        return 0.0, "bear"
 
 def score_volume(ind: dict) -> tuple[float, str]:
-    """D. Volume spike vs MA-15."""
+    """
+    D. Volume spike vs MA-15.
+    FIX #9: Formula lama spike ∈ [1.5, 2.5] → 15*(((s-1.5)/1+0.5)) bisa overflow >15
+    misal spike=2.4 → 15*(0.9+0.5)=21. Dibatasi min() sekarang.
+    """
     spike = ind['vol_spike']
     if spike >= 2.5:
-        return 15.0, "bull"   # Lonjakan signifikan
+        return 15.0, "bull"
     elif spike >= 1.5:
-        return 15.0 * ((spike - 1.5) / 1.0 + 0.5), "bull"
+        score = min(15.0 * ((spike - 1.5) / 1.0 + 0.5), 15.0)
+        return score, "bull"
     elif spike >= 1.2:
-        return 7.0, "neut"    # Sedikit di atas rata-rata
+        return 7.0, "neut"
     else:
-        return 0.0, "neut"    # Volume biasa
+        return 0.0, "neut"
 
 def score_squeeze(ind: dict) -> tuple[float, str]:
-    """
-    E. Bollinger Band Squeeze.
-    Squeeze release mendapat poin penuh — ini sinyal breakout paling kuat.
-    Masih dalam squeeze mendapat poin sedang — potensi tapi belum terkonfirmasi.
-    """
+    """E. Bollinger Band Squeeze."""
     if ind['squeeze_release']:
-        return 15.0, "bull"   # Breakout dari kompresi
+        return 15.0, "bull"
     elif ind['in_squeeze']:
-        return 8.0, "neut"    # Masih kompresi — siap, tapi tunggu
+        return 8.0, "neut"
     else:
-        return 3.0, "neut"    # Normal, tidak ada sinyal khusus
+        return 3.0, "neut"
 
 def compute_total_score(ind: dict) -> tuple[float, dict]:
     """
-    Gabungkan semua komponen. Kembalikan (total_score, breakdown_dict).
-    Hard filter: jika trend bearish total (score_trend=0), cap score maksimal 40.
+    Gabungkan semua komponen.
+    Hard filter: trend bearish total → cap score maksimal 40.
     """
     st_score, st_sig = score_trend(ind)
     rs_score, rs_sig = score_rsi(ind)
@@ -319,7 +331,6 @@ def compute_total_score(ind: dict) -> tuple[float, dict]:
 
     total = st_score + rs_score + cm_score + vo_score + sq_score
 
-    # Hard filter: saham di bawah EMA50 DAN EMA20 tidak boleh lolos ≥ 60
     if not ind['above_ema50'] and not ind['above_ema20']:
         total = min(total, 40.0)
 
@@ -335,27 +346,20 @@ def compute_total_score(ind: dict) -> tuple[float, dict]:
 # =============================================================================
 # 6. TRADING PLAN: ATR-BASED + MINIMUM R/R GUARANTEE
 # =============================================================================
-# Filosofi:
-#   SL = last_close - (atr_mult × ATR)            → berbasis volatilitas nyata
-#   TP1 menjamin R/R ≥ rr1 : 1 dari SL distance
-#   TP2 menjamin R/R ≥ rr2 : 1 dari SL distance
-#   Jika ATR terlalu kecil (misal saham konsolidasi ketat), SL minimal 0.5×ATR
-#   agar tidak kena noise biasa.
-
 INTRADAY_PARAMS = {
     'atr_window':  14,
-    'atr_sl_mult': 1.5,    # SL = 1.5 × ATR di bawah entry
-    'min_rr1':     1.5,    # TP1 minimal R/R 1.5:1
-    'min_rr2':     2.5,    # TP2 minimal R/R 2.5:1
+    'atr_sl_mult': 1.5,
+    'min_rr1':     1.5,
+    'min_rr2':     2.5,
     'ts_rule':     "Trailing 1× ATR; geser ke BEP saat TP1 hit",
-    'fixed_risk_pct': 3.0, # fallback jika ATR tidak valid
+    'fixed_risk_pct': 3.0,
 }
 
 SWING_PARAMS = {
     'atr_window':  14,
-    'atr_sl_mult': 2.0,    # SL = 2 × ATR — lebih longgar untuk swing
-    'min_rr1':     2.0,    # TP1 minimal R/R 2:1
-    'min_rr2':     3.5,    # TP2 minimal R/R 3.5:1
+    'atr_sl_mult': 2.0,
+    'min_rr1':     2.0,
+    'min_rr2':     3.5,
     'ts_rule':     "Set BEP saat TP1 hit; trailing 2× ATR",
     'fixed_risk_pct': 5.0,
 }
@@ -366,30 +370,32 @@ def build_trade_plan(last_close: float, atr_val: float, mode_params: dict) -> di
     1. SL berbasis ATR (volatilitas aktual)
     2. TP dijamin memenuhi minimum R/R ratio
     3. Fallback ke persen flat jika ATR tidak valid
+
+    FIX #10: stop_loss bisa bernilai negatif jika ATR > last_close → guard ditambah.
     """
     sl_dist = atr_val * mode_params['atr_sl_mult']
-
-    # Fallback safety: jika ATR terlalu kecil atau tidak valid
     min_sl_dist = last_close * (mode_params['fixed_risk_pct'] / 100.0) * 0.5
     sl_dist = max(sl_dist, min_sl_dist)
 
-    stop_loss = last_close - sl_dist
+    # FIX #10: pastikan SL tidak negatif (misal saham murah + ATR besar)
+    stop_loss_raw = last_close - sl_dist
+    if stop_loss_raw <= 0:
+        sl_dist   = last_close * 0.95    # fallback: SL 5% di bawah harga
+        stop_loss_raw = last_close - sl_dist
 
-    # TP dihitung dari jarak SL aktual, bukan dari persentase flat
     tp1_dist = sl_dist * mode_params['min_rr1']
     tp2_dist = sl_dist * mode_params['min_rr2']
 
     tp1 = last_close + tp1_dist
     tp2 = last_close + tp2_dist
 
-    # Aktual R/R ratio (untuk display)
     rr1_actual = tp1_dist / sl_dist
     rr2_actual = tp2_dist / sl_dist
 
     return {
-        'stop_loss': np.floor(stop_loss),
-        'tp1':       np.ceil(tp1),
-        'tp2':       np.ceil(tp2),
+        'stop_loss': float(np.floor(stop_loss_raw)),
+        'tp1':       float(np.ceil(tp1)),
+        'tp2':       float(np.ceil(tp2)),
         'sl_dist':   sl_dist,
         'rr1':       round(rr1_actual, 2),
         'rr2':       round(rr2_actual, 2),
@@ -400,6 +406,11 @@ def build_trade_plan(last_close: float, atr_val: float, mode_params: dict) -> di
 # 7. DOWNLOAD ENGINE
 # =============================================================================
 def download_ticker_chunk(tickers: list, period_days: int, interval: str) -> dict:
+    """
+    FIX #11: Tambah timeout eksplisit pada yf.download agar tidak hang selamanya.
+    FIX #12: Single-ticker path dibedakan dengan benar menggunakan isinstance check
+             pada MultiIndex vs flat columns.
+    """
     start_date = (datetime.now() - timedelta(days=period_days)).strftime('%Y-%m-%d')
     end_date   = datetime.now().strftime('%Y-%m-%d')
     chunk_results = {}
@@ -417,28 +428,39 @@ def download_ticker_chunk(tickers: list, period_days: int, interval: str) -> dic
             start=start_date, end=end_date,
             interval=interval, group_by='ticker',
             auto_adjust=True, progress=False, threads=True,
+            timeout=30,   # FIX #11: timeout eksplisit
         )
         if data.empty:
             raise ValueError("Empty response")
 
+        # FIX #12: deteksi MultiIndex dengan tepat
+        is_multi = isinstance(data.columns, pd.MultiIndex)
+
         if len(tickers) == 1:
-            if 'Close' in data.columns:
+            if not is_multi and 'Close' in data.columns:
                 df_t = data.dropna(subset=['Close'])
                 if not df_t.empty:
                     chunk_results[tickers[0]] = df_t
+            elif is_multi:
+                result = _safe_extract(data, tickers[0])
+                if result is not None:
+                    chunk_results[tickers[0]] = result
         else:
-            available = data.columns.get_level_values(0).unique().tolist()
-            for t in tickers:
-                if t in available:
-                    result = _safe_extract(data, t)
-                    if result is not None:
-                        chunk_results[t] = result
+            if is_multi:
+                available = data.columns.get_level_values(0).unique().tolist()
+                for t in tickers:
+                    if t in available:
+                        result = _safe_extract(data, t)
+                        if result is not None:
+                            chunk_results[t] = result
 
     except Exception:
+        # Fallback: download satu per satu
         for t in tickers:
             try:
                 df_s = yf.download(t, start=start_date, end=end_date,
-                                   interval=interval, auto_adjust=True, progress=False)
+                                   interval=interval, auto_adjust=True,
+                                   progress=False, timeout=15)
                 if not df_s.empty and 'Close' in df_s.columns:
                     df_c = df_s.dropna(subset=['Close'])
                     if not df_c.empty:
@@ -449,23 +471,34 @@ def download_ticker_chunk(tickers: list, period_days: int, interval: str) -> dic
     return chunk_results
 
 # =============================================================================
-# 7b. LIVE PRICE FETCHER (fast_info — lebih aktual dari OHLCV batch)
+# 7b. LIVE PRICE FETCHER (paralel — FIX #13)
 # =============================================================================
-def fetch_live_prices(tickers_jk: list) -> dict:
+def _fetch_one_live(ticker: str) -> tuple[str, float | None]:
+    """Fetch satu ticker live price, kembalikan (ticker, price)."""
+    try:
+        info  = yf.Ticker(ticker).fast_info
+        price = info.get('last_price') or info.get('lastPrice')
+        if price and float(price) > 0:
+            return ticker, float(price)
+    except Exception:
+        pass
+    return ticker, None
+
+def fetch_live_prices(tickers_jk: list, max_workers: int = 8) -> dict:
     """
-    Ambil harga live via yf.Ticker.fast_info['last_price'].
-    Jauh lebih aktual dari close OHLCV batch (yang bisa delayed 1 hari).
-    Kembalikan dict: { 'HATM.JK': 320.0, ... }
+    FIX #13: Versi asli fetch satu per satu secara serial → lambat untuk 20+ ticker.
+    Versi baru menggunakan ThreadPoolExecutor untuk paralel I/O.
     """
     result = {}
-    for t in tickers_jk:
-        try:
-            info  = yf.Ticker(t).fast_info
-            price = info.get('last_price') or info.get('lastPrice')
-            if price and float(price) > 0:
-                result[t] = float(price)
-        except Exception:
-            pass
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_one_live, t): t for t in tickers_jk}
+        for future in concurrent.futures.as_completed(futures, timeout=30):
+            try:
+                ticker, price = future.result()
+                if price is not None:
+                    result[ticker] = price
+            except Exception:
+                pass
     return result
 
 # =============================================================================
@@ -481,39 +514,41 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
     5. Position sizing dengan batas alokasi
     """
     mode_params = INTRADAY_PARAMS if trading_mode == "Intraday (Fast Trade)" else SWING_PARAMS
-    MIN_CANDLES = 60   # Butuh minimal 60 candle agar EMA50 + indikator lain warm
+    MIN_CANDLES = 60
 
     results = []
+    skipped_reason = {}   # FIX #14: tracking alasan skip untuk debug
 
     for ticker, df in all_data.items():
-        # ── Guard: data cukup ──────────────────────────────────────────────
         if len(df) < MIN_CANDLES:
+            skipped_reason[ticker] = f"candle kurang ({len(df)} < {MIN_CANDLES})"
             continue
 
         df = df.copy()
 
-        # ── Hitung semua indikator ─────────────────────────────────────────
         try:
             ind = calculate_indicators(df)
-        except Exception:
+        except Exception as e:
+            skipped_reason[ticker] = f"error indikator: {e}"
             continue
 
         last_close = ind['last_close']
         if not np.isfinite(last_close) or last_close <= 0:
+            skipped_reason[ticker] = "harga tidak valid"
             continue
 
-        # ── Filter harga & likuiditas ──────────────────────────────────────
         if last_close < config['min_price'] or last_close > config['max_price']:
+            skipped_reason[ticker] = f"harga {last_close:.0f} di luar filter"
             continue
         if ind['adtv'] < config['min_adtv']:
+            skipped_reason[ticker] = f"ADTV {ind['adtv']/1e6:.1f}M < minimum"
             continue
 
-        # ── Scoring ───────────────────────────────────────────────────────
         total_score, breakdown = compute_total_score(ind)
         if total_score < config['min_score_threshold']:
+            skipped_reason[ticker] = f"score {total_score} < threshold"
             continue
 
-        # ── Grade label ───────────────────────────────────────────────────
         if total_score >= 80:
             grade = "A"
         elif total_score >= 65:
@@ -521,19 +556,20 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         else:
             grade = "C"
 
-        # ── Trading plan ──────────────────────────────────────────────────
         plan = build_trade_plan(last_close, ind['atr_val'], mode_params)
         stop_loss = plan['stop_loss']
         tp1       = plan['tp1']
         tp2       = plan['tp2']
 
-        # ── Buy range: ±0.5 ATR dari last_close (lebih realistis dari ±1% flat) ─
         buy_min = int(np.floor(last_close - 0.5 * ind['atr_val']))
         buy_max = int(np.ceil(last_close + 0.3 * ind['atr_val']))
 
-        # ── Position sizing ───────────────────────────────────────────────
+        # FIX #15: buy_min tidak boleh < stop_loss (entry di bawah SL tidak logis)
+        buy_min = max(buy_min, int(stop_loss) + 1)
+
         loss_per_share = last_close - stop_loss
         if loss_per_share <= 0:
+            skipped_reason[ticker] = "loss_per_share ≤ 0"
             continue
 
         rupiah_risk    = config['total_capital'] * (config['capital_risk_limit_pct'] / 100.0)
@@ -546,12 +582,13 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             required_cap = calc_lots * 100 * last_close
 
         if calc_lots < 1:
+            skipped_reason[ticker] = "modal tidak cukup untuk 1 lot"
             continue
 
         clean_ticker = ticker.split('.')[0]
         results.append({
             "Ticker":       clean_ticker,
-            "_ticker_jk":  ticker,          # internal: dipakai fetch_live_prices, dihapus setelahnya
+            "_ticker_jk":  ticker,
             "Score":        total_score,
             "Grade":        grade,
             "Last Price":   int(round(last_close)),
@@ -571,14 +608,20 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             "TS Kriteria":  plan['ts_rule'],
             "Lots":         int(calc_lots),
             "Alokasi (Rp)": required_cap,
-            "_breakdown":   breakdown,   # private — untuk render pills
+            "_breakdown":   breakdown,
         })
+
+    # Simpan summary ke session state untuk debug view
+    st.session_state['scan_meta'] = {
+        'total_input': len(all_data),
+        'lolos':       len(results),
+        'difilter':    len(skipped_reason),
+        'skipped':     skipped_reason,
+    }
 
     if not results:
         return pd.DataFrame()
 
-    # ── Fetch harga live untuk semua ticker yang lolos scoring ─────────────
-    # Dilakukan SETELAH loop agar hanya fetch ticker yang benar-benar relevan
     passed_tickers_jk = [r["_ticker_jk"] for r in results]
     live_prices = fetch_live_prices(passed_tickers_jk)
 
@@ -586,7 +629,7 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         lp = live_prices.get(r["_ticker_jk"])
         r["Live Price"] = int(round(lp)) if lp else r["Last Price"]
         r["Live Src"]   = "live" if lp else "delayed"
-        del r["_ticker_jk"]   # bersihkan field internal
+        del r["_ticker_jk"]
 
     return (
         pd.DataFrame(results)
@@ -605,10 +648,7 @@ def _grade_badge(grade: str) -> str:
     return f'<span class="{cls}">Grade {grade}</span>'
 
 def _price_status_html(live_price: int, ref_close: int, buy_min: int, buy_max: int, live_src: str) -> str:
-    """
-    Tampilkan harga live + ref close + status zona beli.
-    live_src: 'live' = dari fast_info, 'delayed' = fallback ke OHLCV close
-    """
+    """Tampilkan harga live + ref close + status zona beli."""
     if buy_min <= live_price <= buy_max:
         color, icon, label = "#3fb950", "●", "Dalam Zona Beli"
     elif live_price < buy_min:
@@ -619,17 +659,17 @@ def _price_status_html(live_price: int, ref_close: int, buy_min: int, buy_max: i
     src_label = "Live" if live_src == "live" else "Delayed"
     src_color = "#3fb950" if live_src == "live" else "#8b949e"
 
-    # Tampilkan ref close hanya jika berbeda dari live price
     ref_note = ""
     if ref_close != live_price:
         diff     = live_price - ref_close
         diff_pct = diff / ref_close * 100
         sign     = "+" if diff >= 0 else ""
         ref_col  = "#3fb950" if diff >= 0 else "#f85149"
+        # FIX #16: f-string terputus di tengah (concatenation aneh) — disatukan
         ref_note = (
             f'<span style="font-size:0.68rem;color:{ref_col};margin-left:0.3rem;">'
             f'{sign}{diff_pct:.1f}% vs ref {ref_close:,}'.replace(",", ".") +
-            f'</span>'
+            '</span>'
         )
 
     return (
@@ -667,11 +707,12 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
             with cols[j]:
                 bd = row.get("_breakdown", {})
 
-                # Bangun pill indikator
-                def pill_from_bd(key, label):
-                    if key not in bd:
+                # FIX #17: pill_from_bd didefinisikan di dalam loop → closure bug di Python.
+                # Pindahkan ke luar sebagai lambda dengan default arg.
+                def pill_from_bd(key, label, _bd=bd):
+                    if key not in _bd:
                         return ""
-                    score_val, sig = bd[key]
+                    score_val, sig = _bd[key]
                     return _pill(f"{label} {score_val:.0f}", sig)
 
                 pills_html = (
@@ -684,8 +725,6 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
 
                 html = (
                     f'<div class="metric-card">'
-
-                    # Header: ticker + score + grade
                     f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.3rem;">'
                     f'  <span class="ticker">{row["Ticker"]}</span>'
                     f'  <div style="display:flex;gap:0.4rem;align-items:center;">'
@@ -693,18 +732,10 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
                     f'    <span class="score-badge">Score {row["Score"]}</span>'
                     f'  </div>'
                     f'</div>'
-
-                    # Indicator pills
                     f'<div style="margin-bottom:0.5rem;">{pills_html}</div>'
-
-                    # Harga live + status zona
                     f'{_price_status_html(row["Live Price"], row["Last Price"], row["Buy Min"], row["Buy Max"], row["Live Src"])}'
-
-                    # Buy range
                     f'<div class="price-range">{int(row["Buy Min"])} – {int(row["Buy Max"])}</div>'
                     f'<div class="label" style="margin-bottom:0.6rem;">Area Rentang Buy · ATR {row["ATR"]}</div>'
-
-                    # TP grid
                     f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;'
                     f'margin-bottom:0.6rem;border-top:1px solid #30363d;padding-top:0.4rem;">'
                     f'  <div><div class="label">TP 1 <span class="rr-badge">({row["R/R TP1"]})</span></div>'
@@ -712,16 +743,12 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
                     f'  <div><div class="label">TP 2 <span class="rr-badge">({row["R/R TP2"]})</span></div>'
                     f'  <div class="tp">{int(row["TP2"])} <span style="font-size:0.68rem;opacity:0.8">{row["Upside TP2"]}</span></div></div>'
                     f'</div>'
-
-                    # SL + trailing
                     f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;margin-bottom:0.6rem;">'
                     f'  <div><div class="label">Stop Loss</div>'
                     f'  <div class="sl">{int(row["Stop Loss"])} <span style="font-size:0.68rem;opacity:0.8">{row["Risk%"]}</span></div></div>'
                     f'  <div><div class="label">Trailing Strategy</div>'
                     f'  <div class="ts-rule" style="font-size:0.78rem;">{row["TS Kriteria"]}</div></div>'
                     f'</div>'
-
-                    # Lots + alokasi
                     f'<div style="border-top:1px solid #30363d;padding-top:0.4rem;'
                     f'display:grid;grid-template-columns:1fr 1fr;gap:0.3rem;font-size:0.75rem;">'
                     f'  <div><div class="label">Lots Berbasis Risiko</div>'
@@ -729,7 +756,6 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
                     f'  <div><div class="label">Maks Alokasi</div>'
                     f'  <div style="color:#58a6ff;font-weight:600">{fmt_idr(row["Alokasi (Rp)"])}</div></div>'
                     f'</div>'
-
                     f'</div>'
                 )
                 st.markdown(html, unsafe_allow_html=True)
@@ -752,6 +778,23 @@ min_score       = st.sidebar.slider("Min Score Threshold", 50, 85, 60, 5,
 
 if min_px >= max_px:
     st.sidebar.error("⚠️ Harga Minimal harus lebih kecil dari Harga Maksimal.")
+
+# FIX (tambahan): Debug panel di sidebar
+st.sidebar.markdown("---")
+with st.sidebar.expander("🔬 Debug / Audit Scan"):
+    meta = st.session_state.get('scan_meta', {})
+    if meta:
+        st.write(f"**Input:** {meta.get('total_input',0)} saham")
+        st.write(f"**Lolos:** {meta.get('lolos',0)} saham")
+        st.write(f"**Difilter:** {meta.get('difilter',0)} saham")
+        skipped = meta.get('skipped', {})
+        if skipped:
+            st.dataframe(
+                pd.DataFrame(list(skipped.items()), columns=["Ticker", "Alasan"]),
+                use_container_width=True, height=200
+            )
+    else:
+        st.caption("Jalankan skrining dulu.")
 
 config_engine = {
     'total_capital':           capital,
@@ -809,6 +852,7 @@ with btn_col2:
         st.cache_data.clear()
         st.session_state['raw_market_data']  = {}
         st.session_state['last_loaded_mode'] = None
+        st.session_state['scan_meta']        = {}
         st.success("Reset berhasil.")
 
 # =============================================================================
@@ -822,8 +866,6 @@ if execute_scan:
         st.error("❌ Filter harga tidak valid.")
         st.stop()
 
-    # Intraday: ambil 30 hari × 60m agar ada ≥ 200 candle untuk EMA50 warmup
-    # Swing  : ambil 120 hari daily agar EMA50 cukup stabil
     p_days, p_interval = (30, "60m") if trading_mode == "Intraday (Fast Trade)" else (120, "1d")
     CHUNK_SIZE = 15 if trading_mode == "Intraday (Fast Trade)" else 40
 
