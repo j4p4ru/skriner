@@ -94,6 +94,59 @@ st.markdown("""
         text-align:center;
     }
     .dimmed { opacity: 0.35; pointer-events:none; user-select:none; filter:grayscale(60%); }
+    /* Screening Result Table */
+    .screening-table-wrap {
+        overflow-x: auto; margin-top: 1.5rem;
+        border: 1px solid #30363d; border-radius: 10px;
+    }
+    .screening-table-wrap table {
+        width: 100%; border-collapse: collapse;
+        font-size: 0.78rem; color: #c9d1d9;
+    }
+    .screening-table-wrap thead tr {
+        background: #161b22; border-bottom: 2px solid #30363d;
+    }
+    .screening-table-wrap thead th {
+        padding: 0.6rem 0.8rem; text-align: center;
+        font-size: 0.65rem; font-weight: 700; color: #8b949e;
+        text-transform: uppercase; letter-spacing: 0.5px;
+        white-space: nowrap;
+    }
+    .screening-table-wrap thead th.tp-header {
+        color: #3fb950; background: rgba(63,185,80,0.06);
+    }
+    .screening-table-wrap thead th.sl-header {
+        color: #f85149; background: rgba(248,81,73,0.06);
+    }
+    .screening-table-wrap thead th.buy-header {
+        color: #58a6ff; background: rgba(88,166,255,0.06);
+    }
+    .screening-table-wrap tbody tr {
+        border-bottom: 1px solid #21262d; transition: background 0.15s;
+    }
+    .screening-table-wrap tbody tr:last-child { border-bottom: none; }
+    .screening-table-wrap tbody tr:hover { background: rgba(255,255,255,0.03); }
+    .screening-table-wrap tbody tr.best-buy-row {
+        background: rgba(255,215,0,0.05) !important;
+        border-left: 3px solid #ffd700;
+    }
+    .screening-table-wrap tbody tr.expired-row { opacity: 0.45; }
+    .screening-table-wrap tbody td {
+        padding: 0.55rem 0.8rem; text-align: center; vertical-align: middle;
+    }
+    .tbl-ticker { font-weight: 800; color: #58a6ff; font-size: 0.85rem; }
+    .tbl-tp  { font-weight: 700; color: #3fb950; background: rgba(63,185,80,0.08); border-radius: 4px; padding: 0.15rem 0.4rem; }
+    .tbl-sl  { font-weight: 700; color: #f85149; background: rgba(248,81,73,0.08); border-radius: 4px; padding: 0.15rem 0.4rem; }
+    .tbl-buy { font-weight: 700; color: #58a6ff; background: rgba(88,166,255,0.08); border-radius: 4px; padding: 0.15rem 0.4rem; }
+    .tbl-rr  { color: #d2a8ff; font-weight: 600; font-size: 0.7rem; }
+    .tbl-score-hi { color: #3fb950; font-weight: 800; }
+    .tbl-score-md { color: #e3b341; font-weight: 700; }
+    .tbl-score-lo { color: #8b949e; font-weight: 600; }
+    .tbl-status-valid   { color: #3fb950; font-weight: 700; font-size: 0.68rem; }
+    .tbl-status-waiting { color: #e3b341; font-weight: 700; font-size: 0.68rem; }
+    .tbl-status-expired { color: #f85149; font-weight: 700; font-size: 0.68rem; }
+    .tbl-crown { font-size: 0.68rem; }
+
     /* Best Buy highlight */
     .best-buy-card {
         border-color: #ffd700 !important;
@@ -1508,6 +1561,126 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
                 st.markdown(html, unsafe_allow_html=True)
 
 # =============================================================================
+# 9b. RENDER SCREENING RESULT TABLE
+# =============================================================================
+def render_screening_table(df: pd.DataFrame, best_ticker: str | None = None):
+    """
+    Tampilkan tabel ringkasan hasil skrining di bawah kartu.
+    Kolom Trading Plan (Zona Beli, TP1, TP2, SL, R/R) di-highlight dengan warna.
+    """
+    if df.empty:
+        return
+
+    st.markdown("---")
+    st.markdown("### 📊 Tabel Ringkasan Hasil Skrining")
+    st.caption("Kolom Trading Plan disorot — hijau = TP, merah = SL, biru = Zona Beli")
+
+    rows_html = ""
+    for _, row in df.iterrows():
+        ticker = row["Ticker"]
+        validity = _check_signal_validity(
+            row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"]
+        )
+        status  = validity['status']
+        is_best = (ticker == best_ticker)
+
+        # Row class
+        if is_best:
+            row_cls = "best-buy-row"
+        elif status == "expired":
+            row_cls = "expired-row"
+        else:
+            row_cls = ""
+
+        # Score color
+        score = row["Score"]
+        if score >= 75:
+            score_cls = "tbl-score-hi"
+        elif score >= 60:
+            score_cls = "tbl-score-md"
+        else:
+            score_cls = "tbl-score-lo"
+
+        # Status label
+        if status == "valid":
+            status_html = '<span class="tbl-status-valid">● Zona Beli</span>'
+        elif status == "waiting":
+            status_html = '<span class="tbl-status-waiting">⏳ Tunggu</span>'
+        else:
+            status_html = '<span class="tbl-status-expired">⚠ Expired</span>'
+
+        # Grade badge
+        grade = row.get("Grade", "C")
+        grade_color = {"A": "#3fb950", "B": "#58a6ff", "C": "#db6d28"}.get(grade, "#8b949e")
+
+        # Crown for best buy
+        crown = '<span class="tbl-crown">👑 </span>' if is_best else ""
+
+        # Format numbers
+        def fmt(v):
+            try:
+                return f"{int(v):,}".replace(",", ".")
+            except Exception:
+                return str(v)
+
+        rows_html += (
+            f'<tr class="{row_cls}">'
+            f'  <td>{crown}<span class="tbl-ticker">{ticker}</span></td>'
+            f'  <td><span style="color:{grade_color};font-weight:800;">{grade}</span></td>'
+            f'  <td><span class="{score_cls}">{score}</span></td>'
+            f'  <td>{status_html}</td>'
+            f'  <td style="color:#c9d1d9;font-weight:600;">{fmt(row["Live Price"])}</td>'
+            # Trading Plan highlight columns
+            f'  <td><span class="tbl-buy">{fmt(row["Buy Min"])} – {fmt(row["Buy Max"])}</span></td>'
+            f'  <td>'
+            f'    <span class="tbl-tp">{fmt(row["TP1"])}</span>'
+            f'    <span class="tbl-rr"> {row["R/R TP1"]}</span>'
+            f'  </td>'
+            f'  <td>'
+            f'    <span class="tbl-tp">{fmt(row["TP2"])}</span>'
+            f'    <span class="tbl-rr"> {row["R/R TP2"]}</span>'
+            f'  </td>'
+            f'  <td>'
+            f'    <span class="tbl-sl">{fmt(row["Stop Loss"])}</span>'
+            f'    <span style="font-size:0.65rem;color:#8b949e;margin-left:0.2rem;">{row["Risk%"]}</span>'
+            f'  </td>'
+            f'  <td style="color:#c9d1d9;">{row["ATR"]}</td>'
+            f'  <td style="color:#bc8cff;font-weight:600;">{int(row["Lots"])} Lot</td>'
+            f'  <td style="color:#58a6ff;font-size:0.72rem;">{fmt_idr(row["Alokasi (Rp)"])}</td>'
+            f'  <td style="color:#db6d28;font-size:0.68rem;max-width:140px;white-space:normal;text-align:left;">{row["TS Kriteria"]}</td>'
+            f'</tr>'
+        )
+
+    table_html = f"""
+    <div class="screening-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Ticker</th>
+            <th>Grade</th>
+            <th>Score</th>
+            <th>Status</th>
+            <th>Harga Live</th>
+            <th class="buy-header">📍 Zona Beli</th>
+            <th class="tp-header">🎯 TP 1</th>
+            <th class="tp-header">🎯 TP 2</th>
+            <th class="sl-header">🛡 Stop Loss</th>
+            <th>ATR</th>
+            <th>Lots</th>
+            <th>Alokasi</th>
+            <th>Trailing Strategy</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_html}
+        </tbody>
+      </table>
+    </div>
+    """
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
+# =============================================================================
 # 10. SIDEBAR
 # =============================================================================
 st.sidebar.header("⚙️ Parameter Algoritma")
@@ -1645,6 +1818,9 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
         st.info("ℹ️ Tidak ada saham dengan sinyal valid yang cukup kuat untuk direkomendasikan entry sekarang.")
 
     render_trade_cards(final_df, max_cards=6, best_ticker=best_ticker)
+
+    # ── Tabel Ringkasan Hasil Skrining ────────────────────────────────────
+    render_screening_table(final_df, best_ticker=best_ticker)
 
     # ── Debug panel — diisi setelah engine selesai ────────────────────────
     meta = st.session_state.get('scan_meta', {})
