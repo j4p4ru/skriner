@@ -1526,22 +1526,9 @@ min_score       = st.sidebar.slider("Min Score Threshold", 50, 85, 60, 5,
 if min_px >= max_px:
     st.sidebar.error("⚠️ Harga Minimal harus lebih kecil dari Harga Maksimal.")
 
-# FIX (tambahan): Debug panel di sidebar
+# FIX: Debug panel pakai placeholder — diisi SETELAH engine jalan
 st.sidebar.markdown("---")
-with st.sidebar.expander("🔬 Debug / Audit Scan"):
-    meta = st.session_state.get('scan_meta', {})
-    if meta:
-        st.write(f"**Input:** {meta.get('total_input',0)} saham")
-        st.write(f"**Lolos:** {meta.get('lolos',0)} saham")
-        st.write(f"**Difilter:** {meta.get('difilter',0)} saham")
-        skipped = meta.get('skipped', {})
-        if skipped:
-            st.dataframe(
-                pd.DataFrame(list(skipped.items()), columns=["Ticker", "Alasan"]),
-                use_container_width=True, height=200
-            )
-    else:
-        st.caption("Jalankan skrining dulu.")
+debug_placeholder = st.sidebar.empty()
 
 config_engine = {
     'total_capital':           capital,
@@ -1659,5 +1646,41 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
 
     render_trade_cards(final_df, max_cards=6, best_ticker=best_ticker)
 
+    # ── Debug panel — diisi setelah engine selesai ────────────────────────
+    meta = st.session_state.get('scan_meta', {})
+    with debug_placeholder.expander("🔬 Debug / Audit Scan", expanded=False):
+        st.write(f"**Input:** {meta.get('total_input', 0)} saham")
+        st.write(f"**Lolos:** {meta.get('lolos', 0)} saham")
+        st.write(f"**Difilter:** {meta.get('difilter', 0)} saham")
+        skipped = meta.get('skipped', {})
+        if skipped:
+            st.dataframe(
+                pd.DataFrame(list(skipped.items()), columns=["Ticker", "Alasan"]),
+                use_container_width=True, height=200
+            )
+        else:
+            st.caption("Semua saham lolos filter atau tidak ada yang difilter.")
+
 elif st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] != trading_mode:
     st.warning("⚠️ Mode trading diubah. Klik **🚀 Jalankan Skrining** untuk memperbarui data.")
+
+# ── Fallback: debug panel tetap terisi dari session state sebelumnya ──────
+if not st.session_state.get('raw_market_data'):
+    with debug_placeholder.expander("🔬 Debug / Audit Scan", expanded=False):
+        st.caption("Jalankan skrining dulu.")
+elif 'scan_meta' in st.session_state and st.session_state['scan_meta']:
+    meta = st.session_state['scan_meta']
+    # Hanya render kalau placeholder belum diisi (tidak ada cara cek langsung,
+    # tapi safe karena Streamlit idempotent — render ulang tidak masalah)
+    with debug_placeholder.expander("🔬 Debug / Audit Scan", expanded=False):
+        st.write(f"**Input:** {meta.get('total_input', 0)} saham")
+        st.write(f"**Lolos:** {meta.get('lolos', 0)} saham")
+        st.write(f"**Difilter:** {meta.get('difilter', 0)} saham")
+        skipped = meta.get('skipped', {})
+        if skipped:
+            st.dataframe(
+                pd.DataFrame(list(skipped.items()), columns=["Ticker", "Alasan"]),
+                use_container_width=True, height=200
+            )
+        else:
+            st.caption("Semua saham lolos filter.")
