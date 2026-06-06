@@ -1659,10 +1659,5 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
 
     render_trade_cards(final_df, max_cards=6, best_ticker=best_ticker)
 
-    if not final_df.empty:
-        st.markdown("### 📋 Tabel Lengkap")
-        display_cols = [c for c in final_df.columns if not c.startswith("_") and c != "Live Src"]
-        st.dataframe(final_df[display_cols], use_container_width=True)
-
 elif st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] != trading_mode:
     st.warning("⚠️ Mode trading diubah. Klik **🚀 Jalankan Skrining** untuk memperbarui data.")
