@@ -434,41 +434,56 @@ def analyse_tape(df: pd.DataFrame) -> dict:
     last_range     = ranges5[-1]
     last_body      = abs(cl5[-1] - op5[-1])
     last_close_pos = (cl5[-1] - lo5[-1]) / max(last_range, 1e-9)
+    body_ratio     = last_body / max(last_range, 1e-9)
 
-    if (last_vol_ratio > 2.5 and last_body / max(last_range, 1e-9) > 0.6
+    if (last_vol_ratio > 2.5 and body_ratio > 0.6
             and cl5[-1] > op5[-1] and last_close_pos > 0.7):
-        signals.append(('buying_climax', 'distrib',
-                        'Buying Climax', 'BC',
-                        min(int(last_vol_ratio / 3.0 * 100), 90)))
+        signals.append({
+            'key': 'buying_climax', 'style': 'distrib',
+            'label': 'Buying Climax', 'short': 'BC',
+            'conf_pct': min(int(last_vol_ratio / 3.0 * 100), 90),
+        })
 
     # ── Selling Climax: volume sangat tinggi + bearish besar ──
-    if (last_vol_ratio > 2.5 and last_body / max(last_range, 1e-9) > 0.6
+    if (last_vol_ratio > 2.5 and body_ratio > 0.6
             and cl5[-1] < op5[-1] and last_close_pos < 0.3):
-        signals.append(('selling_climax', 'accum',
-                        'Selling Climax', 'SC',
-                        min(int(last_vol_ratio / 3.0 * 100), 90)))
+        signals.append({
+            'key': 'selling_climax', 'style': 'accum',
+            'label': 'Selling Climax', 'short': 'SC',
+            'conf_pct': min(int(last_vol_ratio / 3.0 * 100), 90),
+        })
 
     # ── Absorption: volume besar tapi harga tidak turun jauh (close_pos tinggi) ──
-    if (last_vol_ratio > 1.8 and last_close_pos > 0.55
+    # Guard: tidak overlap dengan Buying Climax (body_ratio > 0.6 + close_pos > 0.7)
+    already_bc = any(s['key'] == 'buying_climax' for s in signals)
+    if (not already_bc and last_vol_ratio > 1.8 and last_close_pos > 0.55
             and abs(cl5[-1] - cl5[-2]) / max(atr5, 1e-9) < 0.5):
-        signals.append(('absorption', 'accum',
-                        'Absorption', 'ABS',
-                        min(int(last_close_pos * last_vol_ratio / 2.5 * 100), 85)))
+        signals.append({
+            'key': 'absorption', 'style': 'accum',
+            'label': 'Absorption', 'short': 'ABS',
+            'conf_pct': min(int(last_close_pos * last_vol_ratio / 2.5 * 100), 85),
+        })
 
     # ── Exhaustion: volume tinggi tapi range candle kecil ──
     if (last_vol_ratio > 1.8 and last_range < avg_range5 * 0.6):
-        signals.append(('exhaustion', 'warn',
-                        'Exhaustion', 'EXH',
-                        min(int((avg_range5 / max(last_range, 1e-9)) * 20), 80)))
+        signals.append({
+            'key': 'exhaustion', 'style': 'warn',
+            'label': 'Exhaustion', 'short': 'EXH',
+            'conf_pct': min(int((avg_range5 / max(last_range, 1e-9)) * 20), 80),
+        })
 
     # ── Accumulation Quiet: 5 candle volume rendah konsisten, harga tidak turun ──
     vol_consistent_low = all(v < vol_ma * 0.8 for v in vol5)
     price_stable       = (max(cl5) - min(cl5)) / max(atr5, 1e-9) < 1.5
     if vol_consistent_low and price_stable:
-        signals.append(('accum_quiet', 'accum',
-                        'Akumulasi Senyap', 'AQ',
-                        72))
+        signals.append({
+            'key': 'accum_quiet', 'style': 'accum',
+            'label': 'Akumulasi Senyap', 'short': 'AQ',
+            'conf_pct': 72,
+        })
 
+    # FIX: sort by confidence (sama seperti bandarmology)
+    signals.sort(key=lambda x: x['conf_pct'], reverse=True)
     dominant = signals[0] if signals else None
     return {'signals': signals, 'dominant': dominant}
 
@@ -691,17 +706,16 @@ def score_trend(ind: dict) -> tuple[float, str]:
 def score_rsi(ind: dict) -> tuple[float, str]:
     """
     B. RSI 14.
-    - Zona ideal setup: 40–65
-    - RSI > 75 = overbought → penalty
-    - FIX #8: Base 20 + bonus 5 bisa melebihi cap 20 — dibatasi min() sudah benar
-              tapi logika bonus harusnya hanya aktif di zona sweet spot.
+    - Zona ideal setup: 40–65 → base 15pt, bonus +5 jika rising → maks 20pt
+    - RSI > 75 = overbought → penalty 2pt
+    - FIX: base 15 (bukan 20) agar bonus rsi_rising benar-benar aktif
     """
     rsi = ind['rsi_val']
     if rsi > 75:
         return 2.0, "bear"
     elif 40 <= rsi <= 65:
         bonus = 5.0 if ind['rsi_rising'] else 0.0
-        return min(20.0 + bonus, 20.0), "bull"   # bonus tidak pernah membuat > 20
+        return min(15.0 + bonus, 20.0), "bull"   # 15 base + 5 rising bonus = maks 20
     elif 65 < rsi <= 75:
         return 10.0, "neut"
     elif 30 <= rsi < 40:
@@ -981,9 +995,11 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             skipped_reason[ticker] = f"score {total_score} < threshold"
             continue
 
+        # Grade dinamis: threshold atas = 80, B = threshold+5 s/d 79, C = threshold s/d threshold+4
+        thresh = config['min_score_threshold']
         if total_score >= 80:
             grade = "A"
-        elif total_score >= 65:
+        elif total_score >= max(65.0, thresh + 5):
             grade = "B"
         else:
             grade = "C"
@@ -1001,10 +1017,13 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         buy_min = int(np.floor(last_close - 0.5 * ind['atr_val']))
         buy_max = int(np.ceil(last_close + 0.3 * ind['atr_val']))
 
-        # FIX #15: buy_min tidak boleh < stop_loss (entry di bawah SL tidak logis)
+        # FIX #15: buy_min tidak boleh < stop_loss
         buy_min = max(buy_min, int(stop_loss) + 1)
+        # FIX: buy_max tidak boleh < buy_min (edge case ATR kecil + SL dekat)
+        buy_max = max(buy_max, buy_min + max(1, int(ind['atr_val'] * 0.1)))
 
-        loss_per_share = last_close - stop_loss
+        # FIX: sizing konservatif dari entry terburuk (buy_max), bukan last_close
+        loss_per_share = buy_max - stop_loss
         if loss_per_share <= 0:
             skipped_reason[ticker] = "loss_per_share ≤ 0"
             continue
@@ -1013,14 +1032,23 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         calc_lots      = int(rupiah_risk / loss_per_share / 100)
 
         max_alloc      = config['total_capital'] * (config['max_capital_allocation_pct'] / 100.0)
-        required_cap   = calc_lots * 100 * last_close
+        required_cap   = calc_lots * 100 * buy_max   # alokasi dari harga entry terburuk
         if required_cap > max_alloc:
-            calc_lots    = int(max_alloc / (100 * last_close))
-            required_cap = calc_lots * 100 * last_close
+            calc_lots    = int(max_alloc / (100 * buy_max))
+            required_cap = calc_lots * 100 * buy_max
 
         if calc_lots < 1:
             skipped_reason[ticker] = "modal tidak cukup untuk 1 lot"
             continue
+
+        # FIX: upside dari buy_max (entry terburuk) & risk range dari buy_min–buy_max
+        upside_tp1_pct = round((tp1 - buy_max) / buy_max * 100, 1)
+        upside_tp2_pct = round((tp2 - buy_max) / buy_max * 100, 1)
+        risk_min_pct   = round((buy_min - stop_loss) / buy_min * 100, 1)
+        risk_max_pct   = round((buy_max - stop_loss) / buy_max * 100, 1)
+        # R/R aktual dari entry terburuk
+        rr1_actual = round((tp1 - buy_max) / loss_per_share, 2)
+        rr2_actual = round((tp2 - buy_max) / loss_per_share, 2)
 
         clean_ticker = ticker.split('.')[0]
         results.append({
@@ -1032,19 +1060,23 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             "Buy Min":      buy_min,
             "Buy Max":      buy_max,
             "TP1":          int(tp1),
-            "Upside TP1":   f"+{round((tp1 - last_close) / last_close * 100, 1)}%",
+            "Upside TP1":   f"+{upside_tp1_pct}%",
             "TP2":          int(tp2),
-            "Upside TP2":   f"+{round((tp2 - last_close) / last_close * 100, 1)}%",
+            "Upside TP2":   f"+{upside_tp2_pct}%",
             "Stop Loss":    int(stop_loss),
-            "Risk%":        f"-{round((last_close - stop_loss) / last_close * 100, 1)}%",
-            "R/R TP1":      f"1:{plan['rr1']}",
-            "R/R TP2":      f"1:{plan['rr2']}",
+            "Risk%":        f"-{risk_min_pct}% / -{risk_max_pct}%",
+            "R/R TP1":      f"1:{rr1_actual}",
+            "R/R TP2":      f"1:{rr2_actual}",
             "ATR":          round(ind['atr_val'], 1),
             "RSI":          round(ind['rsi_val'], 1),
             "CMF":          round(ind['cmf_val'], 3),
             "TS Kriteria":  plan['ts_rule'],
             "Lots":         int(calc_lots),
             "Alokasi (Rp)": required_cap,
+            # OPTIMASI: flag zona stale (live berbeda > 1×ATR dari close)
+            "_zone_stale":  False,   # diisi setelah live price tersedia
+            "_atr_val":     ind['atr_val'],
+            "_last_close":  last_close,
             "_breakdown":   breakdown,
             "_vol_ctx":     vol_ctx,
             "_tape":        tape,
@@ -1069,7 +1101,12 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         lp = live_prices.get(r["_ticker_jk"])
         r["Live Price"] = int(round(lp)) if lp else r["Last Price"]
         r["Live Src"]   = "live" if lp else "delayed"
+        # OPTIMASI: tandai zona stale jika live bergerak > 1×ATR dari harga close
+        if lp:
+            r["_zone_stale"] = abs(lp - r["_last_close"]) > r["_atr_val"]
         del r["_ticker_jk"]
+        del r["_atr_val"]
+        del r["_last_close"]
 
     return (
         pd.DataFrame(results)
@@ -1140,7 +1177,7 @@ def _render_tape_bandar_html(tape: dict, bandar: dict) -> str:
     tape_sigs = tape.get('signals', [])
     if tape_sigs:
         pills_html = ''.join(
-            _tape_pill(s[3], s[1], s[4]) for s in tape_sigs[:4]
+            _tape_pill(s['short'], s['style'], s['conf_pct']) for s in tape_sigs[:4]
         )
         parts.append(
             f'<div style="margin-bottom:0.25rem;">'
@@ -1163,8 +1200,35 @@ def _render_tape_bandar_html(tape: dict, bandar: dict) -> str:
         )
 
     # ── Narasi ────────────────────────────────────────────────────────────
-    narasi_tech  = bandar.get('narasi_tech', '')
-    narasi_plain = bandar.get('narasi_plain', '')
+    # FIX: pilih narasi dari sinyal dominant terkuat (tape vs bandar)
+    tape_dom   = tape.get('dominant')
+    bandar_dom = bandar.get('dominant')
+    if tape_dom and bandar_dom:
+        use_bandar_narasi = bandar_dom['conf_pct'] >= tape_dom['conf_pct']
+    else:
+        use_bandar_narasi = bool(bandar_dom)
+
+    narasi_tech  = bandar.get('narasi_tech', '') if use_bandar_narasi else ''
+    narasi_plain = bandar.get('narasi_plain', '') if use_bandar_narasi else ''
+
+    # Jika tape dominant lebih kuat, bangun narasi dari tape
+    if not use_bandar_narasi and tape_dom:
+        tape_narasi_map = {
+            'buying_climax':  ("Volume ekstrem + candle bullish besar — potensi buying climax.",
+                               "Semua orang beli sekarang, tapi ini saat bandar mulai jual. Waspada balik arah."),
+            'selling_climax': ("Volume ekstrem + candle bearish besar — selling climax, potensi reversal naik.",
+                               "Semua orang panik jual. Ini biasanya momen bandar masuk beli murah."),
+            'absorption':     ("Volume besar namun harga tidak turun signifikan — demand menyerap supply.",
+                               "Ada yang beli besar dan menahan harga agar tidak jatuh. Tanda akumulasi aktif."),
+            'exhaustion':     ("Volume tinggi tapi range candle kecil — tenaga gerak mulai habis.",
+                               "Banyak yang trading tapi harga nggak kemana-mana. Momentum hampir habis."),
+            'accum_quiet':    ("5 candle volume rendah konsisten, harga tidak turun — akumulasi senyap.",
+                               "Tidak ada yang buang saham ini. Bandar sedang diam-diam mengumpulkan."),
+        }
+        narasi_tech, narasi_plain = tape_narasi_map.get(
+            tape_dom['key'], ("Sinyal tape terdeteksi.", "Pantau pergerakan lebih lanjut.")
+        )
+
     if narasi_tech:
         parts.append(
             f'<div style="background:rgba(255,255,255,0.02);border-left:2px solid #30363d;'
@@ -1277,25 +1341,24 @@ def compute_best_buy_score(row: pd.Series) -> tuple[float, list[str]]:
     dom    = bandar.get("dominant")
     if dom:
         conf_pts = {"high": 15, "med": 8, "low": 3}.get(dom.get("conf", "low"), 3)
-        # Hanya akumulasi / markup yang bernilai positif; distribusi dikurangi
-        if dom.get("style") in ("distrib",):
-            conf_pts = -5
-            reasons.append(f"⚠️ Sinyal distribusi bandar terdeteksi")
+        if dom.get("style") == "distrib":
+            # Distribusi: penalti, tidak tambah poin
+            total -= 5
+            reasons.append("⚠️ Sinyal distribusi bandar terdeteksi")
         else:
             total += conf_pts
             reasons.append(f"🔍 Bandar: {dom.get('label','')} ({dom.get('conf','')})")
-        total += conf_pts if dom.get("style") not in ("distrib",) else 0
     else:
         reasons.append("— Tidak ada sinyal bandar")
 
-    # 5. Tape bullish confirmation
+    # 5. Tape bullish confirmation — FIX: tape signals sekarang dict
     tape      = row.get("_tape", {})
     tape_sigs = tape.get("signals", [])
-    accum_tape = [s for s in tape_sigs if s[1] in ("accum",)]
+    accum_tape = [s for s in tape_sigs if s['style'] == 'accum']
     if accum_tape:
         total += 10
-        reasons.append(f"📼 Tape: {accum_tape[0][2]}")
-    elif any(s[1] == "distrib" for s in tape_sigs):
+        reasons.append(f"📼 Tape: {accum_tape[0]['label']}")
+    elif any(s['style'] == 'distrib' for s in tape_sigs):
         total -= 5
         reasons.append("📼 Tape: sinyal distribusi")
 
@@ -1497,6 +1560,15 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
                 else:
                     banner_html = ''
 
+                # OPTIMASI: stale zone warning (live bergerak > 1×ATR dari close)
+                is_stale = row.get("_zone_stale", False)
+                stale_html = (
+                    '<div style="background:rgba(219,109,40,0.08);border:1px solid rgba(219,109,40,0.3);'
+                    'border-radius:6px;padding:0.3rem 0.6rem;margin-bottom:0.4rem;font-size:0.67rem;color:#db6d28;">'
+                    '⚡ Zona beli dihitung saat close — harga sudah bergerak >1×ATR. Verifikasi entry sebelum order.'
+                    '</div>'
+                ) if (is_stale and not is_expired) else ''
+
                 # Dimmed wrapper untuk level TP/SL/Lots saat expired
                 dim_open  = '<div class="dimmed">' if is_expired else '<div>'
                 dim_close = '</div>'
@@ -1524,6 +1596,9 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
 
                     # Validity banner (tampil jika tidak valid)
                     f'{banner_html}'
+
+                    # Stale zone warning
+                    f'{stale_html}'
 
                     # Harga live + zona — selalu tampil tapi pesan sudah ada di banner
                     f'{_price_status_html(row["Live Price"], row["Last Price"], row["Buy Min"], row["Buy Max"], row["Live Src"])}'
@@ -1613,8 +1688,10 @@ def render_screening_table(df: pd.DataFrame, best_ticker: str | None = None):
         grade = row.get("Grade", "C")
         grade_color = {"A": "#3fb950", "B": "#58a6ff", "C": "#db6d28"}.get(grade, "#8b949e")
 
-        # Crown for best buy
+        # Crown for best buy + stale flag
+        is_stale = row.get("_zone_stale", False)
         crown = '<span class="tbl-crown">👑 </span>' if is_best else ""
+        stale_flag = ' <span style="color:#db6d28;font-size:0.6rem;font-weight:700;" title="Zona stale >1×ATR dari close">⚡</span>' if is_stale else ""
 
         # Format numbers
         def fmt(v):
@@ -1625,7 +1702,7 @@ def render_screening_table(df: pd.DataFrame, best_ticker: str | None = None):
 
         rows_html += (
             f'<tr class="{row_cls}">'
-            f'  <td>{crown}<span class="tbl-ticker">{ticker}</span></td>'
+            f'  <td>{crown}<span class="tbl-ticker">{ticker}</span>{stale_flag}</td>'
             f'  <td><span style="color:{grade_color};font-weight:800;">{grade}</span></td>'
             f'  <td><span class="{score_cls}">{score}</span></td>'
             f'  <td>{status_html}</td>'
@@ -1635,14 +1712,16 @@ def render_screening_table(df: pd.DataFrame, best_ticker: str | None = None):
             f'  <td>'
             f'    <span class="tbl-tp">{fmt(row["TP1"])}</span>'
             f'    <span class="tbl-rr"> {row["R/R TP1"]}</span>'
+            f'    <div style="font-size:0.62rem;color:#3fb950;opacity:0.7;">{row["Upside TP1"]}</div>'
             f'  </td>'
             f'  <td>'
             f'    <span class="tbl-tp">{fmt(row["TP2"])}</span>'
             f'    <span class="tbl-rr"> {row["R/R TP2"]}</span>'
+            f'    <div style="font-size:0.62rem;color:#3fb950;opacity:0.7;">{row["Upside TP2"]}</div>'
             f'  </td>'
             f'  <td>'
             f'    <span class="tbl-sl">{fmt(row["Stop Loss"])}</span>'
-            f'    <span style="font-size:0.65rem;color:#8b949e;margin-left:0.2rem;">{row["Risk%"]}</span>'
+            f'    <div style="font-size:0.62rem;color:#f85149;opacity:0.8;margin-top:1px;">{row["Risk%"]}</div>'
             f'  </td>'
             f'  <td style="color:#c9d1d9;">{row["ATR"]}</td>'
             f'  <td style="color:#bc8cff;font-weight:600;">{int(row["Lots"])} Lot</td>'
