@@ -94,6 +94,24 @@ st.markdown("""
         text-align:center;
     }
     .dimmed { opacity: 0.35; pointer-events:none; user-select:none; filter:grayscale(60%); }
+    /* Best Buy highlight */
+    .best-buy-card {
+        border-color: #ffd700 !important;
+        background: linear-gradient(135deg, rgba(255,215,0,0.06) 0%, #161b22 60%) !important;
+        box-shadow: 0 0 0 2px rgba(255,215,0,0.25), 0 6px 20px rgba(255,215,0,0.1) !important;
+    }
+    .best-buy-crown {
+        display:inline-flex; align-items:center; gap:0.3rem;
+        background:linear-gradient(90deg,#ffd700,#ffb300);
+        color:#0d1117; font-size:0.72rem; font-weight:900;
+        padding:0.2rem 0.65rem; border-radius:20px;
+        letter-spacing:0.3px; margin-bottom:0.5rem;
+    }
+    .best-buy-banner {
+        background:linear-gradient(135deg,rgba(255,215,0,0.12),rgba(255,179,0,0.06));
+        border:1px solid rgba(255,215,0,0.4); border-radius:8px;
+        padding:0.8rem 1rem; margin-bottom:1.2rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1161,6 +1179,158 @@ def _price_status_html(live_price: int, ref_close: int, buy_min: int, buy_max: i
     )
 
 
+def compute_best_buy_score(row: pd.Series) -> tuple[float, list[str]]:
+    """
+    Hitung composite score "layak entry sekarang" untuk setiap baris hasil scan.
+    Berbeda dari Score utama (kualitas teknikal) — ini mengukur kesiapan entry:
+
+    Komponen                          Maks    Logika
+    ─────────────────────────────────────────────────────────────────────
+    1. Signal validity                 30     valid=30, waiting=10, expired=0
+    2. Score utama (dinormalisasi)     25     score/100 × 25
+    3. Grade bonus                     10     A=10, B=6, C=2
+    4. Bandar confidence               15     high=15, med=8, low=3, none=0
+    5. Bullish tape confirmation       10     ada sinyal accum tape = +10
+    6. Volume konteks                  10     vol spike + bullish candle = +10
+    ─────────────────────────────────────────────────────────────────────
+    Total maks                        100
+    """
+    reasons = []
+    total   = 0.0
+
+    # 1. Signal validity
+    validity = _check_signal_validity(
+        row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"]
+    )
+    if validity['status'] == 'valid':
+        total += 30; reasons.append("✅ Harga dalam zona beli")
+    elif validity['status'] == 'waiting':
+        total += 10; reasons.append("⏳ Di bawah zona, SL masih aman")
+    else:
+        return 0.0, []   # expired → tidak pernah jadi best buy
+
+    # 2. Score teknikal
+    tech_pts = (row["Score"] / 100.0) * 25
+    total += tech_pts
+    reasons.append(f"📊 Score teknikal {row['Score']}")
+
+    # 3. Grade
+    grade_map = {"A": 10, "B": 6, "C": 2}
+    total += grade_map.get(row.get("Grade", "C"), 2)
+    reasons.append(f"🏅 Grade {row.get('Grade','C')}")
+
+    # 4. Bandar confidence
+    bandar = row.get("_bandar", {})
+    dom    = bandar.get("dominant")
+    if dom:
+        conf_pts = {"high": 15, "med": 8, "low": 3}.get(dom.get("conf", "low"), 3)
+        # Hanya akumulasi / markup yang bernilai positif; distribusi dikurangi
+        if dom.get("style") in ("distrib",):
+            conf_pts = -5
+            reasons.append(f"⚠️ Sinyal distribusi bandar terdeteksi")
+        else:
+            total += conf_pts
+            reasons.append(f"🔍 Bandar: {dom.get('label','')} ({dom.get('conf','')})")
+        total += conf_pts if dom.get("style") not in ("distrib",) else 0
+    else:
+        reasons.append("— Tidak ada sinyal bandar")
+
+    # 5. Tape bullish confirmation
+    tape      = row.get("_tape", {})
+    tape_sigs = tape.get("signals", [])
+    accum_tape = [s for s in tape_sigs if s[1] in ("accum",)]
+    if accum_tape:
+        total += 10
+        reasons.append(f"📼 Tape: {accum_tape[0][2]}")
+    elif any(s[1] == "distrib" for s in tape_sigs):
+        total -= 5
+        reasons.append("📼 Tape: sinyal distribusi")
+
+    # 6. Volume konteks
+    vc = row.get("_vol_ctx", {})
+    if vc.get("valid"):
+        vol_ok  = vc.get("vol_ratio", 0) >= 1.3
+        bull_ok = vc.get("candle_dir") == "bullish"
+        if vol_ok and bull_ok:
+            total += 10; reasons.append("📊 Vol spike + candle bullish")
+        elif vol_ok:
+            total += 5;  reasons.append("📊 Vol spike (candle netral/bear)")
+        elif bull_ok:
+            total += 3;  reasons.append("📊 Candle bullish (vol normal)")
+
+    return round(max(total, 0.0), 1), reasons
+
+
+def pick_best_buy(df: pd.DataFrame) -> tuple[str | None, float, list[str]]:
+    """Pilih satu ticker dengan composite best-buy score tertinggi."""
+    if df.empty:
+        return None, 0.0, []
+
+    best_ticker, best_score, best_reasons = None, -1.0, []
+    for _, row in df.iterrows():
+        s, r = compute_best_buy_score(row)
+        if s > best_score:
+            best_score, best_reasons, best_ticker = s, r, row["Ticker"]
+
+    return best_ticker, best_score, best_reasons
+
+
+def render_best_buy_banner(ticker: str, score: float, reasons: list[str], row: pd.Series):
+    """Tampilkan banner Best Buy di atas hasil scan."""
+    validity = _check_signal_validity(
+        row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"]
+    )
+    status_label = "🟢 Harga dalam zona — siap entry" if validity['status'] == 'valid' \
+                   else "🟡 Di bawah zona — pantau & tunggu"
+    status_color = "#3fb950" if validity['status'] == 'valid' else "#e3b341"
+
+    # Confidence bar visual
+    bar_w = min(int(score), 100)
+    bar_c = "#ffd700" if score >= 70 else "#e3b341" if score >= 50 else "#8b949e"
+
+    reasons_html = "".join(
+        f'<span style="display:inline-block;background:rgba(255,255,255,0.06);'
+        f'border-radius:6px;padding:0.1rem 0.4rem;margin:0.1rem;font-size:0.68rem;color:#c9d1d9;">'
+        f'{r}</span>'
+        for r in reasons
+    )
+
+    html = (
+        f'<div class="best-buy-banner">'
+        f'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">'
+        f'  <div>'
+        f'    <span class="best-buy-crown">👑 BEST BUY</span>'
+        f'    <span style="font-size:1.5rem;font-weight:900;color:#ffd700;margin-left:0.5rem;">{ticker}</span>'
+        f'    <span style="font-size:0.8rem;color:{status_color};margin-left:0.6rem;font-weight:700;">{status_label}</span>'
+        f'  </div>'
+        f'  <div style="text-align:right;">'
+        f'    <div style="font-size:0.65rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px;">Entry Score</div>'
+        f'    <div style="font-size:1.4rem;font-weight:900;color:#ffd700;">{score}<span style="font-size:0.7rem;color:#8b949e;">/100</span></div>'
+        f'  </div>'
+        f'</div>'
+        f'<div style="margin-top:0.5rem;">'
+        f'  <div class="vol-bar-track" style="margin-bottom:0.4rem;">'
+        f'    <div class="vol-bar-fill" style="width:{bar_w}%;background:{bar_c};height:6px;border-radius:4px;"></div>'
+        f'  </div>'
+        f'  <div style="font-size:0.65rem;color:#8b949e;margin-bottom:0.25rem;text-transform:uppercase;letter-spacing:0.4px;">Alasan Pemilihan</div>'
+        f'  <div style="line-height:1.8;">{reasons_html}</div>'
+        f'</div>'
+        f'<div style="margin-top:0.5rem;padding-top:0.4rem;border-top:1px solid rgba(255,215,0,0.2);'
+        f'display:grid;grid-template-columns:repeat(4,1fr);gap:0.4rem;font-size:0.72rem;">'
+        f'  <div><div style="color:#8b949e;font-size:0.6rem;">HARGA LIVE</div>'
+        f'  <div style="color:#fff;font-weight:700;">{int(row["Live Price"]):,}'.replace(",",".") + f'</div></div>'
+        f'  <div><div style="color:#8b949e;font-size:0.6rem;">ZONA BELI</div>'
+        f'  <div style="color:#fff;font-weight:700;">{int(row["Buy Min"]):,}–{int(row["Buy Max"]):,}'.replace(",",".") + f'</div></div>'
+        f'  <div><div style="color:#8b949e;font-size:0.6rem;">STOP LOSS</div>'
+        f'  <div style="color:#f85149;font-weight:700;">{int(row["Stop Loss"]):,}'.replace(",",".") + f'</div></div>'
+        f'  <div><div style="color:#8b949e;font-size:0.6rem;">TARGET TP1</div>'
+        f'  <div style="color:#3fb950;font-weight:700;">{int(row["TP1"]):,} <span style="font-size:0.65rem;">{row["Upside TP1"]}</span></div></div>'.replace(",",".") +
+        f'</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def _check_signal_validity(live_price: int, stop_loss: int, buy_min: int, buy_max: int) -> dict:
     """
     Tentukan status validitas sinyal berdasarkan harga live vs level kunci.
@@ -1204,7 +1374,7 @@ def _check_signal_validity(live_price: int, stop_loss: int, buy_min: int, buy_ma
         }
 
 
-def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
+def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | None = None):
     if df.empty:
         st.info("ℹ️ Tidak ada saham yang memenuhi kriteria atau alokasi modal tidak cukup.")
         return
@@ -1247,11 +1417,20 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
                     row["Live Price"], row["Stop Loss"],
                     row["Buy Min"],   row["Buy Max"]
                 )
-                is_expired  = validity['status'] == 'expired'
-                is_waiting  = validity['status'] == 'waiting'
-                card_cls    = validity['card_cls']
+                is_best  = (row["Ticker"] == best_ticker)
+                card_cls = validity['card_cls']
+                if is_best:
+                    card_cls = "best-buy-card"   # override warna border
+
+                # Crown badge — hanya di kartu best buy
+                crown_html = (
+                    '<div><span class="best-buy-crown">👑 Best Buy</span></div>'
+                    if is_best else ''
+                )
 
                 # Banner HTML
+                is_expired = validity['status'] == 'expired'
+                is_waiting = validity['status'] == 'waiting'
                 if is_expired or is_waiting:
                     banner_html = (
                         f'<div class="{validity["banner_cls"]}">'
@@ -1271,6 +1450,9 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
 
                 html = (
                     f'<div class="metric-card {card_cls}">'
+
+                    # Crown badge best buy
+                    f'{crown_html}'
 
                     # Header: ticker + score + grade
                     f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.3rem;">'
@@ -1466,7 +1648,16 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
     final_df = quant_strategy_engine(st.session_state['raw_market_data'], config_engine, trading_mode)
 
     st.markdown(f"### 📈 Hasil Scan [{trading_mode}]")
-    render_trade_cards(final_df, max_cards=6)
+
+    # ── Best Buy Recommendation ───────────────────────────────────────────
+    best_ticker, best_score, best_reasons = pick_best_buy(final_df)
+    if best_ticker:
+        best_row = final_df[final_df["Ticker"] == best_ticker].iloc[0]
+        render_best_buy_banner(best_ticker, best_score, best_reasons, best_row)
+    else:
+        st.info("ℹ️ Tidak ada saham dengan sinyal valid yang cukup kuat untuk direkomendasikan entry sekarang.")
+
+    render_trade_cards(final_df, max_cards=6, best_ticker=best_ticker)
 
     if not final_df.empty:
         st.markdown("### 📋 Tabel Lengkap")
