@@ -74,6 +74,26 @@ st.markdown("""
     /* Narasi box */
     .narasi-tech  { font-size:0.72rem; color:#c9d1d9; font-style:italic; line-height:1.35; }
     .narasi-plain { font-size:0.7rem;  color:#8b949e; line-height:1.3; margin-top:0.15rem; }
+    /* Signal validity states */
+    .signal-expired {
+        border-color: #f85149 !important;
+        background: rgba(248,81,73,0.04) !important;
+    }
+    .signal-waiting {
+        border-color: #e3b341 !important;
+        background: rgba(227,179,65,0.04) !important;
+    }
+    .expired-banner {
+        background: rgba(248,81,73,0.12); border:1px solid rgba(248,81,73,0.4);
+        border-radius:6px; padding:0.5rem 0.7rem; margin-bottom:0.5rem;
+        text-align:center;
+    }
+    .waiting-banner {
+        background: rgba(227,179,65,0.1); border:1px solid rgba(227,179,65,0.35);
+        border-radius:6px; padding:0.5rem 0.7rem; margin-bottom:0.5rem;
+        text-align:center;
+    }
+    .dimmed { opacity: 0.35; pointer-events:none; user-select:none; filter:grayscale(60%); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1141,6 +1161,49 @@ def _price_status_html(live_price: int, ref_close: int, buy_min: int, buy_max: i
     )
 
 
+def _check_signal_validity(live_price: int, stop_loss: int, buy_min: int, buy_max: int) -> dict:
+    """
+    Tentukan status validitas sinyal berdasarkan harga live vs level kunci.
+
+    Status:
+    - 'valid'    : harga di dalam atau di atas zona beli, di atas SL → normal
+    - 'waiting'  : harga di bawah zona beli tapi MASIH di atas SL → belum saatnya entry
+    - 'expired'  : harga sudah di bawah SL → sinyal tidak valid, breakdown
+    """
+    if live_price <= stop_loss:
+        gap_pct = round((stop_loss - live_price) / stop_loss * 100, 1)
+        return {
+            'status':   'expired',
+            'title':    '⚠️ Sinyal Tidak Valid — Harga Breakdown',
+            'detail':   f'Harga ({live_price:,}) sudah {gap_pct}% di bawah SL ({stop_loss:,}). Jangan entry — sinyal dihitung saat kondisi berbeda.'.replace(',', '.'),
+            'action':   'Tunggu konfirmasi reversal atau skip saham ini.',
+            'card_cls': 'signal-expired',
+            'banner_cls': 'expired-banner',
+            'title_color': '#f85149',
+        }
+    elif live_price < buy_min:
+        gap_pct = round((buy_min - live_price) / buy_min * 100, 1)
+        return {
+            'status':   'waiting',
+            'title':    '⏳ Harga di Bawah Zona Beli',
+            'detail':   f'Harga ({live_price:,}) masih {gap_pct}% di bawah zona ({buy_min:,}–{buy_max:,}). SL masih aman — pantau, jangan entry dulu.'.replace(',', '.'),
+            'action':   'Entry hanya jika harga masuk zona beli.',
+            'card_cls': 'signal-waiting',
+            'banner_cls': 'waiting-banner',
+            'title_color': '#e3b341',
+        }
+    else:
+        return {
+            'status':   'valid',
+            'title':    '',
+            'detail':   '',
+            'action':   '',
+            'card_cls': '',
+            'banner_cls': '',
+            'title_color': '',
+        }
+
+
 def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
     if df.empty:
         st.info("ℹ️ Tidak ada saham yang memenuhi kriteria atau alokasi modal tidak cukup.")
@@ -1176,11 +1239,40 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
                     + pill_from_bd("squeeze","SQZ")
                 )
 
-                vol_ctx_html    = _render_volume_ctx_html(vol_ctx)
+                vol_ctx_html     = _render_volume_ctx_html(vol_ctx)
                 tape_bandar_html = _render_tape_bandar_html(tape, bandar)
 
+                # ── Signal validity check ──────────────────────────────────
+                validity = _check_signal_validity(
+                    row["Live Price"], row["Stop Loss"],
+                    row["Buy Min"],   row["Buy Max"]
+                )
+                is_expired  = validity['status'] == 'expired'
+                is_waiting  = validity['status'] == 'waiting'
+                card_cls    = validity['card_cls']
+
+                # Banner HTML
+                if is_expired or is_waiting:
+                    banner_html = (
+                        f'<div class="{validity["banner_cls"]}">'
+                        f'  <div style="font-size:0.78rem;font-weight:800;color:{validity["title_color"]};margin-bottom:0.2rem;">'
+                        f'    {validity["title"]}'
+                        f'  </div>'
+                        f'  <div style="font-size:0.68rem;color:#c9d1d9;line-height:1.35;">{validity["detail"]}</div>'
+                        f'  <div style="font-size:0.65rem;color:#8b949e;margin-top:0.2rem;font-style:italic;">{validity["action"]}</div>'
+                        f'</div>'
+                    )
+                else:
+                    banner_html = ''
+
+                # Dimmed wrapper untuk level TP/SL/Lots saat expired
+                dim_open  = '<div class="dimmed">' if is_expired else '<div>'
+                dim_close = '</div>'
+
                 html = (
-                    f'<div class="metric-card">'
+                    f'<div class="metric-card {card_cls}">'
+
+                    # Header: ticker + score + grade
                     f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.3rem;">'
                     f'  <span class="ticker">{row["Ticker"]}</span>'
                     f'  <div style="display:flex;gap:0.4rem;align-items:center;">'
@@ -1188,9 +1280,21 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
                     f'    <span class="score-badge">Score {row["Score"]}</span>'
                     f'  </div>'
                     f'</div>'
+
+                    # Indicator pills (selalu tampil)
                     f'<div style="margin-bottom:0.5rem;">{pills_html}</div>'
+
+                    # Volume context (selalu tampil — tetap informatif)
                     f'{vol_ctx_html}'
+
+                    # Validity banner (tampil jika tidak valid)
+                    f'{banner_html}'
+
+                    # Harga live + zona — selalu tampil tapi pesan sudah ada di banner
                     f'{_price_status_html(row["Live Price"], row["Last Price"], row["Buy Min"], row["Buy Max"], row["Live Src"])}'
+
+                    # Level trading — di-dim jika expired (tidak relevan)
+                    f'{dim_open}'
                     f'<div class="price-range">{int(row["Buy Min"])} – {int(row["Buy Max"])}</div>'
                     f'<div class="label" style="margin-bottom:0.6rem;">Area Rentang Buy · ATR {row["ATR"]}</div>'
                     f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;'
@@ -1213,6 +1317,9 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6):
                     f'  <div><div class="label">Maks Alokasi</div>'
                     f'  <div style="color:#58a6ff;font-weight:600">{fmt_idr(row["Alokasi (Rp)"])}</div></div>'
                     f'</div>'
+                    f'{dim_close}'
+
+                    # Tape & bandar — selalu tampil (tetap berguna untuk context)
                     f'{tape_bandar_html}'
                     f'</div>'
                 )
