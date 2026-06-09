@@ -1166,6 +1166,85 @@ def fetch_live_prices(tickers_jk: list, max_workers: int = 8) -> dict:
     return result
 
 # =============================================================================
+# 7c. STOCK QUALITY FILTER — skip suspend/FCA/zombie/tidur/tidak potensial
+# =============================================================================
+def is_tradeable_stock(ticker: str, df: pd.DataFrame) -> tuple[bool, str]:
+    """
+    Filter pre-engine: cek apakah saham layak untuk diproses lebih lanjut.
+
+    Kategori yang di-skip:
+    1. SUSPENDED / FCA — harga freeze panjang atau volume mati total
+    2. ZOMBIE — harga < 50 (penny stock IDX), terlalu mudah dimanipulasi
+    3. TIDUR (ILLIQUID) — median volume 0 atau candle identik berhari-hari
+    4. HARGA STAGNANT — std deviation harga sangat kecil, saham tidak bergerak
+    5. DATA TIPIS — terlalu banyak NaN atau candle tidak lengkap
+    6. VOLUME MATI — banyak hari dengan volume 0 (de facto suspended)
+    7. SPREAD EKSTREM — High-Low harian terlalu kecil terus-menerus (fake market)
+    8. CANDLE IDENTIK — harga close sama persis N hari berturut-turut (suspended)
+
+    Return: (True, "") jika layak, (False, alasan) jika tidak layak.
+    """
+    if df is None or len(df) < 20:
+        return False, "data kurang dari 20 candle"
+
+    close  = df['Close'].values.astype(float)
+    volume = df['Volume'].values.astype(float)
+    high   = df['High'].values.astype(float)
+    low    = df['Low'].values.astype(float)
+
+    last_close = float(close[-1])
+
+    # ── 1. Zombie: harga < 50 ────────────────────────────────────────────
+    if last_close < 50:
+        return False, f"zombie — harga {last_close:.0f} < 50"
+
+    # ── 2. Candle identik berturut-turut (suspended/freeze) ──────────────
+    # Cek 10 hari terakhir: jika 7+ hari close persis sama → suspended
+    recent_close = close[-10:]
+    unique_prices = len(set(np.round(recent_close, 0)))
+    if unique_prices <= 2:
+        return False, f"suspended/freeze — hanya {unique_prices} harga unik dalam 10 hari"
+
+    # ── 3. Volume mati: banyak hari volume = 0 ───────────────────────────
+    recent_vol = volume[-20:]
+    zero_vol_days = int(np.sum(recent_vol == 0))
+    if zero_vol_days >= 8:
+        return False, f"volume mati — {zero_vol_days}/20 hari volume 0"
+
+    # ── 4. Median volume terlalu rendah (saham tidur) ────────────────────
+    median_vol = float(np.median(recent_vol[recent_vol > 0])) if np.any(recent_vol > 0) else 0
+    if median_vol < 5_000:
+        return False, f"tidur — median volume {median_vol:,.0f} lot/hari"
+
+    # ── 5. Harga stagnant: std price sangat kecil relatif terhadap harga ─
+    price_std = float(np.std(close[-20:]))
+    price_cv  = price_std / max(last_close, 1)   # coefficient of variation
+    if price_cv < 0.005:   # std < 0.5% dari harga → nyaris tidak bergerak
+        return False, f"stagnant — CV harga {price_cv*100:.3f}% < 0.5%"
+
+    # ── 6. Spread H-L terlalu kecil: saham tidur / fake market ───────────
+    hl_range  = high - low
+    median_hl = float(np.median(hl_range[-20:]))
+    if median_hl < 1.0:   # spread < 1 rupiah median (tick size IDX minimum)
+        return False, f"spread ekstrem — median H-L {median_hl:.1f} < 1 rupiah"
+
+    # ── 7. FCA / UMA proxy: harga naik/turun >35% dalam 5 hari ──────────
+    # FCA biasanya diikuti freeze — tapi kalau masih bisa bergerak,
+    # lebih aman skip karena volatilitas ekstrem tidak bisa dikalkulasi normal
+    if len(close) >= 6:
+        ret_5d = (close[-1] - close[-6]) / max(close[-6], 1)
+        if abs(ret_5d) > 0.35:
+            return False, f"FCA/UMA — return 5h {ret_5d*100:.1f}% ekstrem"
+
+    # ── 8. Data NaN berlebihan ───────────────────────────────────────────
+    nan_ratio = float(np.mean(~np.isfinite(close)))
+    if nan_ratio > 0.15:
+        return False, f"data rusak — {nan_ratio*100:.0f}% NaN"
+
+    return True, ""
+
+
+# =============================================================================
 # 8. MAIN STRATEGY ENGINE
 # =============================================================================
 def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd.DataFrame:
@@ -1189,6 +1268,12 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             continue
 
         df = df.copy()
+
+        # ── Quality filter: skip suspend/FCA/zombie/tidur/tidak potensial ──
+        tradeable, reason = is_tradeable_stock(ticker, df)
+        if not tradeable:
+            skipped_reason[ticker] = reason
+            continue
 
         try:
             ind = calculate_indicators(df)
@@ -2135,15 +2220,49 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
     # ── Debug panel — diisi setelah engine selesai ────────────────────────
     meta = st.session_state.get('scan_meta', {})
     with debug_placeholder.expander("🔬 Debug / Audit Scan", expanded=False):
-        st.write(f"**Input:** {meta.get('total_input', 0)} saham")
-        st.write(f"**Lolos:** {meta.get('lolos', 0)} saham")
-        st.write(f"**Difilter:** {meta.get('difilter', 0)} saham")
         skipped = meta.get('skipped', {})
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Input", meta.get('total_input', 0))
+        col2.metric("Lolos", meta.get('lolos', 0))
+        col3.metric("Difilter", meta.get('difilter', 0))
+
         if skipped:
-            st.dataframe(
-                pd.DataFrame(list(skipped.items()), columns=["Ticker", "Alasan"]),
-                use_container_width=True, height=200
-            )
+            # Kategorisasi alasan skip
+            cats = {
+                "🚫 Zombie/Penny":  [],
+                "💤 Tidur/Illikuid": [],
+                "⛔ Suspend/Freeze": [],
+                "⚡ FCA/UMA":        [],
+                "📉 Score rendah":   [],
+                "🔧 Teknikal/Data":  [],
+                "💰 Harga/ADTV":     [],
+            }
+            for t, reason in skipped.items():
+                r = reason.lower()
+                if "zombie" in r:
+                    cats["🚫 Zombie/Penny"].append((t, reason))
+                elif "tidur" in r or "volume mati" in r or "median volume" in r:
+                    cats["💤 Tidur/Illikuid"].append((t, reason))
+                elif "suspended" in r or "freeze" in r or "stagnant" in r or "spread" in r:
+                    cats["⛔ Suspend/Freeze"].append((t, reason))
+                elif "fca" in r or "uma" in r:
+                    cats["⚡ FCA/UMA"].append((t, reason))
+                elif "score" in r:
+                    cats["📉 Score rendah"].append((t, reason))
+                elif "harga" in r or "adtv" in r or "filter" in r:
+                    cats["💰 Harga/ADTV"].append((t, reason))
+                else:
+                    cats["🔧 Teknikal/Data"].append((t, reason))
+
+            for cat_label, items in cats.items():
+                if items:
+                    st.markdown(f"**{cat_label}** ({len(items)} saham)")
+                    st.dataframe(
+                        pd.DataFrame(items, columns=["Ticker", "Alasan"]),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(150, 38 + len(items) * 35),
+                    )
         else:
             st.caption("Semua saham lolos filter atau tidak ada yang difilter.")
 
@@ -2156,17 +2275,17 @@ if not st.session_state.get('raw_market_data'):
         st.caption("Jalankan skrining dulu.")
 elif 'scan_meta' in st.session_state and st.session_state['scan_meta']:
     meta = st.session_state['scan_meta']
-    # Hanya render kalau placeholder belum diisi (tidak ada cara cek langsung,
-    # tapi safe karena Streamlit idempotent — render ulang tidak masalah)
     with debug_placeholder.expander("🔬 Debug / Audit Scan", expanded=False):
-        st.write(f"**Input:** {meta.get('total_input', 0)} saham")
-        st.write(f"**Lolos:** {meta.get('lolos', 0)} saham")
-        st.write(f"**Difilter:** {meta.get('difilter', 0)} saham")
         skipped = meta.get('skipped', {})
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Input", meta.get('total_input', 0))
+        col2.metric("Lolos", meta.get('lolos', 0))
+        col3.metric("Difilter", meta.get('difilter', 0))
         if skipped:
             st.dataframe(
                 pd.DataFrame(list(skipped.items()), columns=["Ticker", "Alasan"]),
-                use_container_width=True, height=200
+                use_container_width=True, height=200,
+                hide_index=True,
             )
         else:
             st.caption("Semua saham lolos filter.")
