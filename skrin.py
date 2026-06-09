@@ -1839,9 +1839,8 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
 
                 vol_ctx_html     = _render_volume_ctx_html(vol_ctx)
                 tape_bandar_html = _render_tape_bandar_html(tape, bandar)
-                mc_html          = _render_mc_html(row.get("_mc", {}), is_expired=(validity['status'] == 'expired'))
 
-                # ── Signal validity check ──────────────────────────────────
+                # ── Signal validity check — harus sebelum mc_html & banner ──
                 validity = _check_signal_validity(
                     row["Live Price"], row["Stop Loss"],
                     row["Buy Min"],   row["Buy Max"]
@@ -1849,7 +1848,9 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
                 is_best  = (row["Ticker"] == best_ticker)
                 card_cls = validity['card_cls']
                 if is_best:
-                    card_cls = "best-buy-card"   # override warna border
+                    card_cls = "best-buy-card"
+
+                mc_html = _render_mc_html(row.get("_mc", {}), is_expired=(validity['status'] == 'expired'))
 
                 # Crown badge — hanya di kartu best buy
                 crown_html = (
