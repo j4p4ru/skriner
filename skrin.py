@@ -350,6 +350,224 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
     }
 
 # =============================================================================
+# 4a. MONTE CARLO PROBABILITY ENGINE
+# =============================================================================
+def monte_carlo_tp_probability(
+    df: pd.DataFrame,
+    entry: float,
+    tp1: float,
+    tp2: float,
+    stop_loss: float,
+    horizon: int = 10,
+    n_sim: int = 5000,
+    lookback: int = 60,
+) -> dict:
+    """
+    Estimasi probabilistik berbasis simulasi Monte Carlo historis per saham.
+
+    Metodologi:
+    - Ambil distribusi log-return harian dari 'lookback' hari terakhir
+    - Simulasikan 'n_sim' jalur harga selama 'horizon' hari
+    - Hitung fraksi simulasi yang menyentuh TP1/TP2 SEBELUM SL ter-trigger
+    - Hitung distribusi hari (P25, median, P75) untuk tiap target
+
+    Output adalah estimasi statistik, BUKAN prediksi pasti.
+    Akurasi bergantung pada asumsi return berdistribusi mirip historis.
+    """
+    if len(df) < lookback + 5:
+        return {'valid': False}
+
+    close = df['Close'].values.astype(float)
+    # Log-return dari lookback hari terakhir
+    hist   = close[-(lookback + 1):]
+    lrets  = np.diff(np.log(hist))          # shape: (lookback,)
+
+    mu     = float(np.mean(lrets))
+    sigma  = float(np.std(lrets, ddof=1))
+
+    if sigma <= 0 or not np.isfinite(mu) or not np.isfinite(sigma):
+        return {'valid': False}
+
+    # ── Simulasi ──────────────────────────────────────────────────────────
+    rng    = np.random.default_rng(seed=42)   # reproducible
+    shocks = rng.normal(mu, sigma, size=(n_sim, horizon))   # (n_sim, horizon)
+    # Harga path: entry × exp(cumsum returns)
+    paths  = entry * np.exp(np.cumsum(shocks, axis=1))      # (n_sim, horizon)
+
+    # ── Per simulasi: cek apakah menyentuh TP/SL ─────────────────────────
+    hit_tp1_day  = np.full(n_sim, np.nan)   # hari pertama TP1 tersentuh
+    hit_tp2_day  = np.full(n_sim, np.nan)
+    hit_sl_day   = np.full(n_sim, np.nan)
+
+    for d in range(horizon):
+        col = paths[:, d]
+        # TP1: belum hit sebelumnya dan belum kena SL
+        mask_tp1 = np.isnan(hit_tp1_day) & np.isnan(hit_sl_day) & (col >= tp1)
+        hit_tp1_day[mask_tp1] = d + 1
+
+        mask_tp2 = np.isnan(hit_tp2_day) & np.isnan(hit_sl_day) & (col >= tp2)
+        hit_tp2_day[mask_tp2] = d + 1
+
+        mask_sl  = np.isnan(hit_sl_day) & (col <= stop_loss)
+        hit_sl_day[mask_sl]  = d + 1
+
+    # ── Probabilitas ──────────────────────────────────────────────────────
+    # TP harus dicapai SEBELUM SL (atau SL tidak pernah kena)
+    tp1_before_sl = (~np.isnan(hit_tp1_day)) & (
+        np.isnan(hit_sl_day) | (hit_tp1_day <= hit_sl_day)
+    )
+    tp2_before_sl = (~np.isnan(hit_tp2_day)) & (
+        np.isnan(hit_sl_day) | (hit_tp2_day <= hit_sl_day)
+    )
+    sl_hit = ~np.isnan(hit_sl_day)
+
+    prob_tp1 = float(np.mean(tp1_before_sl) * 100)
+    prob_tp2 = float(np.mean(tp2_before_sl) * 100)
+    prob_sl  = float(np.mean(sl_hit) * 100)
+
+    # ── Distribusi hari untuk TP1 (hanya simulasi yang berhasil) ──────────
+    tp1_days_valid = hit_tp1_day[tp1_before_sl]
+    if len(tp1_days_valid) >= 10:
+        day_p25    = int(np.percentile(tp1_days_valid, 25))
+        day_median = int(np.percentile(tp1_days_valid, 50))
+        day_p75    = int(np.percentile(tp1_days_valid, 75))
+    else:
+        day_p25 = day_median = day_p75 = None
+
+    # Ekspektasi R/R berbobot probabilitas
+    expected_rr = None
+    if entry > stop_loss:
+        sl_dist  = entry - stop_loss
+        tp1_dist = tp1  - entry
+        tp2_dist = tp2  - entry
+        p1 = prob_tp1 / 100
+        p2 = (prob_tp2 / 100)
+        p_sl = prob_sl / 100
+        # EV sederhana: P(TP1)×gain_tp1 + P(TP2-TP1)×gain_tp2 - P(SL)×sl_dist
+        ev = p1 * tp1_dist + max(p2 - p1, 0) * tp2_dist - p_sl * sl_dist
+        expected_rr = round(ev / sl_dist, 2) if sl_dist > 0 else None
+
+    return {
+        'valid':       True,
+        'prob_tp1':    round(prob_tp1, 1),
+        'prob_tp2':    round(prob_tp2, 1),
+        'prob_sl':     round(prob_sl, 1),
+        'day_p25':     day_p25,
+        'day_median':  day_median,
+        'day_p75':     day_p75,
+        'expected_rr': expected_rr,
+        'n_sim':       n_sim,
+        'lookback':    lookback,
+        'sigma_daily': round(sigma * 100, 2),   # volatilitas harian %
+    }
+
+
+def _render_mc_html(mc: dict, is_expired: bool = False) -> str:
+    """Render blok probabilitas Monte Carlo di dalam kartu."""
+    if not mc.get('valid'):
+        return ''
+
+    prob_tp1 = mc['prob_tp1']
+    prob_tp2 = mc['prob_tp2']
+    prob_sl  = mc['prob_sl']
+    err      = expected_rr = mc.get('expected_rr')
+
+    # Warna probabilitas TP1
+    if prob_tp1 >= 60:
+        c_tp1 = '#3fb950'
+    elif prob_tp1 >= 40:
+        c_tp1 = '#e3b341'
+    else:
+        c_tp1 = '#f85149'
+
+    if prob_tp2 >= 50:
+        c_tp2 = '#3fb950'
+    elif prob_tp2 >= 30:
+        c_tp2 = '#e3b341'
+    else:
+        c_tp2 = '#8b949e'
+
+    c_sl = '#f85149' if prob_sl >= 40 else '#e3b341' if prob_sl >= 20 else '#8b949e'
+
+    # Bar width (cap 100)
+    bw1  = min(int(prob_tp1), 100)
+    bw2  = min(int(prob_tp2), 100)
+    bwsl = min(int(prob_sl),  100)
+
+    # Distribusi hari TP1
+    if mc.get('day_median') is not None:
+        p25, med, p75 = mc['day_p25'], mc['day_median'], mc['day_p75']
+        day_html = (
+            f'<div style="margin-top:0.3rem;display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;">'
+            f'<span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;">Hari ke-TP1</span>'
+            f'<span style="font-size:0.68rem;color:#8b949e;">cepat: <b style="color:#c9d1d9;">{p25}h</b></span>'
+            f'<span style="font-size:0.68rem;color:#e3b341;font-weight:700;">median {med}h</span>'
+            f'<span style="font-size:0.68rem;color:#8b949e;">lambat: <b style="color:#c9d1d9;">{p75}h</b></span>'
+            f'</div>'
+        )
+    else:
+        day_html = '<div style="font-size:0.65rem;color:#8b949e;margin-top:0.2rem;">Simulasi tidak cukup untuk distribusi hari</div>'
+
+    # Expected R/R
+    if err is not None:
+        err_color = '#3fb950' if err > 0 else '#f85149'
+        err_sign  = '+' if err > 0 else ''
+        err_html  = f'<span style="font-size:0.68rem;color:{err_color};font-weight:700;margin-left:0.5rem;">E[R/R] {err_sign}{err}</span>'
+    else:
+        err_html = ''
+
+    opacity = 'opacity:0.4;' if is_expired else ''
+
+    return (
+        f'<div style="border-top:1px solid #21262d;margin-top:0.5rem;padding-top:0.5rem;{opacity}">'
+        f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.35rem;">'
+        f'  <span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px;">Probabilitas Monte Carlo</span>'
+        f'  <span style="font-size:0.6rem;color:#8b949e;">{mc["n_sim"]:,} sim · {mc["lookback"]}h lookback · σ={mc["sigma_daily"]}%/hari</span>'
+        f'</div>'
+
+        # TP1 bar
+        f'<div style="margin-bottom:0.25rem;">'
+        f'  <div style="display:flex;justify-content:space-between;margin-bottom:0.1rem;">'
+        f'    <span style="font-size:0.68rem;color:#8b949e;">P(TP1 sebelum SL)</span>'
+        f'    <span style="font-size:0.72rem;font-weight:800;color:{c_tp1};">{prob_tp1}%{err_html}</span>'
+        f'  </div>'
+        f'  <div style="background:#21262d;border-radius:3px;height:4px;">'
+        f'    <div style="width:{bw1}%;height:4px;border-radius:3px;background:{c_tp1};"></div>'
+        f'  </div>'
+        f'</div>'
+
+        # TP2 bar
+        f'<div style="margin-bottom:0.25rem;">'
+        f'  <div style="display:flex;justify-content:space-between;margin-bottom:0.1rem;">'
+        f'    <span style="font-size:0.68rem;color:#8b949e;">P(TP2 sebelum SL)</span>'
+        f'    <span style="font-size:0.72rem;font-weight:700;color:{c_tp2};">{prob_tp2}%</span>'
+        f'  </div>'
+        f'  <div style="background:#21262d;border-radius:3px;height:4px;">'
+        f'    <div style="width:{bw2}%;height:4px;border-radius:3px;background:{c_tp2};"></div>'
+        f'  </div>'
+        f'</div>'
+
+        # SL bar
+        f'<div style="margin-bottom:0.3rem;">'
+        f'  <div style="display:flex;justify-content:space-between;margin-bottom:0.1rem;">'
+        f'    <span style="font-size:0.68rem;color:#8b949e;">P(kena SL)</span>'
+        f'    <span style="font-size:0.72rem;font-weight:700;color:{c_sl};">{prob_sl}%</span>'
+        f'  </div>'
+        f'  <div style="background:#21262d;border-radius:3px;height:4px;">'
+        f'    <div style="width:{bwsl}%;height:4px;border-radius:3px;background:{c_sl};"></div>'
+        f'  </div>'
+        f'</div>'
+
+        f'{day_html}'
+
+        f'<div style="margin-top:0.35rem;font-size:0.6rem;color:#484f58;font-style:italic;">'
+        f'⚠ Simulasi berbasis return historis, bukan prediksi. Tidak memperhitungkan gap, berita, atau likuiditas.'
+        f'</div>'
+        f'</div>'
+    )
+
+
+# =============================================================================
 # 4b. VOLUME CONTEXT — analisis candle terakhir
 # =============================================================================
 def analyse_volume_context(df: pd.DataFrame) -> dict:
@@ -1022,6 +1240,14 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         # FIX: buy_max tidak boleh < buy_min (edge case ATR kecil + SL dekat)
         buy_max = max(buy_max, buy_min + max(1, int(ind['atr_val'] * 0.1)))
 
+        # ── Monte Carlo probability (entry = buy_max worst-case) ──────────
+        mc_horizon = 15 if trading_mode == "Intraday (Fast Trade)" else 20
+        mc = monte_carlo_tp_probability(
+            df, entry=float(buy_max),
+            tp1=tp1, tp2=tp2, stop_loss=float(stop_loss),
+            horizon=mc_horizon, n_sim=4000, lookback=60,
+        )
+
         # FIX: sizing konservatif dari entry terburuk (buy_max), bukan last_close
         loss_per_share = buy_max - stop_loss
         if loss_per_share <= 0:
@@ -1081,6 +1307,7 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             "_vol_ctx":     vol_ctx,
             "_tape":        tape,
             "_bandar":      bandar,
+            "_mc":          mc,
         })
 
     # Simpan summary ke session state untuk debug view
@@ -1527,6 +1754,7 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
 
                 vol_ctx_html     = _render_volume_ctx_html(vol_ctx)
                 tape_bandar_html = _render_tape_bandar_html(tape, bandar)
+                mc_html          = _render_mc_html(row.get("_mc", {}), is_expired=(validity['status'] == 'expired'))
 
                 # ── Signal validity check ──────────────────────────────────
                 validity = _check_signal_validity(
@@ -1631,6 +1859,9 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
 
                     # Tape & bandar — selalu tampil (tetap berguna untuk context)
                     f'{tape_bandar_html}'
+
+                    # Monte Carlo probability block
+                    f'{mc_html}'
                     f'</div>'
                 )
                 st.markdown(html, unsafe_allow_html=True)
