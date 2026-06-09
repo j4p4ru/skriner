@@ -1953,20 +1953,167 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
                 st.markdown(html, unsafe_allow_html=True)
 
 # =============================================================================
-# 9b. RENDER SCREENING RESULT TABLE
+# 9b. RENDER SCREENING RESULT TABLE  (interaktif — klik ticker → detail card)
 # =============================================================================
+def _render_detail_card_html(row: pd.Series, best_ticker: str | None) -> str:
+    """
+    Render full detail card HTML untuk satu saham — sama persis dengan kartu utama
+    tapi tanpa render Streamlit column (langsung HTML string).
+    """
+    validity = _check_signal_validity(
+        row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"]
+    )
+    is_best    = (row["Ticker"] == best_ticker)
+    is_expired = validity['status'] == 'expired'
+    is_waiting = validity['status'] == 'waiting'
+    is_stale   = row.get("_zone_stale", False)
+
+    card_cls   = "best-buy-card" if is_best else validity['card_cls']
+
+    bd         = row.get("_breakdown", {})
+    vol_ctx    = row.get("_vol_ctx", {})
+    tape       = row.get("_tape", {})
+    bandar     = row.get("_bandar", {})
+
+    def pill_from_bd(key, label):
+        if key not in bd: return ""
+        score_val, sig = bd[key]
+        return _pill(f"{label} {score_val:.0f}", sig)
+
+    pills_html       = (pill_from_bd("trend","EMA") + pill_from_bd("rsi","RSI")
+                        + pill_from_bd("cmf","CMF") + pill_from_bd("volume","VOL")
+                        + pill_from_bd("squeeze","SQZ"))
+    vol_ctx_html     = _render_volume_ctx_html(vol_ctx)
+    tape_bandar_html = _render_tape_bandar_html(tape, bandar)
+    mc_html          = _render_mc_html(row.get("_mc", {}), is_expired=is_expired)
+
+    crown_html = ('<div><span class="best-buy-crown">👑 Best Buy</span></div>'
+                  if is_best else '')
+
+    if is_expired or is_waiting:
+        banner_html = (
+            f'<div class="{validity["banner_cls"]}">'
+            f'  <div style="font-size:0.78rem;font-weight:800;color:{validity["title_color"]};margin-bottom:0.2rem;">'
+            f'    {validity["title"]}</div>'
+            f'  <div style="font-size:0.68rem;color:#c9d1d9;line-height:1.35;">{validity["detail"]}</div>'
+            f'  <div style="font-size:0.65rem;color:#8b949e;margin-top:0.2rem;font-style:italic;">{validity["action"]}</div>'
+            f'</div>'
+        )
+    else:
+        banner_html = ''
+
+    stale_html = (
+        '<div style="background:rgba(219,109,40,0.08);border:1px solid rgba(219,109,40,0.3);'
+        'border-radius:6px;padding:0.3rem 0.6rem;margin-bottom:0.4rem;font-size:0.67rem;color:#db6d28;">'
+        '⚡ Zona beli dihitung saat close — harga sudah bergerak >1×ATR. Verifikasi entry sebelum order.'
+        '</div>'
+    ) if (is_stale and not is_expired) else ''
+
+    dim_open  = '<div class="dimmed">' if is_expired else '<div>'
+
+    return (
+        f'<div class="metric-card {card_cls}" style="max-width:480px;margin:0 auto;">'
+        f'{crown_html}'
+        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.3rem;">'
+        f'  <span class="ticker">{row["Ticker"]}</span>'
+        f'  <div style="display:flex;gap:0.4rem;align-items:center;">'
+        f'    {_grade_badge(row["Grade"])}'
+        f'    <span class="score-badge">Score {row["Score"]}</span>'
+        f'  </div>'
+        f'</div>'
+        f'<div style="margin-bottom:0.5rem;">{pills_html}</div>'
+        f'{vol_ctx_html}'
+        f'{banner_html}'
+        f'{stale_html}'
+        f'{_price_status_html(row["Live Price"], row["Last Price"], row["Buy Min"], row["Buy Max"], row["Live Src"])}'
+        f'{dim_open}'
+        f'<div class="price-range">{int(row["Buy Min"])} – {int(row["Buy Max"])}</div>'
+        f'<div class="label" style="margin-bottom:0.6rem;">Area Rentang Buy · ATR {row["ATR"]}</div>'
+        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;'
+        f'margin-bottom:0.6rem;border-top:1px solid #30363d;padding-top:0.4rem;">'
+        f'  <div><div class="label">TP 1 <span class="rr-badge">({row["R/R TP1"]})</span></div>'
+        f'  <div class="tp">{int(row["TP1"])} <span style="font-size:0.68rem;opacity:0.8">{row["Upside TP1"]}</span></div></div>'
+        f'  <div><div class="label">TP 2 <span class="rr-badge">({row["R/R TP2"]})</span></div>'
+        f'  <div class="tp">{int(row["TP2"])} <span style="font-size:0.68rem;opacity:0.8">{row["Upside TP2"]}</span></div></div>'
+        f'</div>'
+        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;margin-bottom:0.6rem;">'
+        f'  <div><div class="label">Stop Loss</div>'
+        f'  <div class="sl">{int(row["Stop Loss"])} <span style="font-size:0.68rem;opacity:0.8">{row["Risk%"]}</span></div></div>'
+        f'  <div><div class="label">Trailing Strategy</div>'
+        f'  <div class="ts-rule" style="font-size:0.78rem;">{row["TS Kriteria"]}</div></div>'
+        f'</div>'
+        f'<div style="border-top:1px solid #30363d;padding-top:0.4rem;'
+        f'display:grid;grid-template-columns:1fr 1fr;gap:0.3rem;font-size:0.75rem;">'
+        f'  <div><div class="label">Lots Berbasis Risiko</div>'
+        f'  <div style="color:#fff;font-weight:600">{int(row["Lots"])} Lot</div></div>'
+        f'  <div><div class="label">Maks Alokasi</div>'
+        f'  <div style="color:#58a6ff;font-weight:600">{fmt_idr(row["Alokasi (Rp)"])}</div></div>'
+        f'</div>'
+        f'</div>'
+        f'{tape_bandar_html}'
+        f'{mc_html}'
+        f'</div>'
+    )
+
+
 def render_screening_table(df: pd.DataFrame, best_ticker: str | None = None):
     """
-    Tampilkan tabel ringkasan hasil skrining di bawah kartu.
-    Kolom Trading Plan (Zona Beli, TP1, TP2, SL, R/R) di-highlight dengan warna.
+    Tabel ringkasan hasil skrining.
+    Setiap baris punya tombol ticker — klik untuk muncul detail card lengkap.
     """
     if df.empty:
         return
 
     st.markdown("---")
     st.markdown("### 📊 Tabel Ringkasan Hasil Skrining")
-    st.caption("Kolom Trading Plan disorot — hijau = TP, merah = SL, biru = Zona Beli")
+    st.caption("Klik ticker untuk melihat detail lengkap · Kolom Trading Plan disorot")
 
+    # ── Session state untuk selected ticker ───────────────────────────────
+    if 'selected_ticker_detail' not in st.session_state:
+        st.session_state['selected_ticker_detail'] = None
+
+    # ── Baris tombol ticker ────────────────────────────────────────────────
+    tickers_list = df["Ticker"].tolist()
+    n = len(tickers_list)
+    cols_per_row = min(n, 8)
+    ticker_rows = [tickers_list[i:i+cols_per_row] for i in range(0, n, cols_per_row)]
+
+    for t_row in ticker_rows:
+        cols = st.columns(len(t_row))
+        for col, t in zip(cols, t_row):
+            row_data = df[df["Ticker"] == t].iloc[0]
+            validity = _check_signal_validity(
+                row_data["Live Price"], row_data["Stop Loss"],
+                row_data["Buy Min"],   row_data["Buy Max"]
+            )
+            grade = row_data.get("Grade", "C")
+            grade_color = {"A": "🟢", "B": "🔵", "C": "🟠"}.get(grade, "⚪")
+            is_sel = (st.session_state['selected_ticker_detail'] == t)
+            status_icon = {"valid": "●", "waiting": "⏳", "expired": "⚠"}.get(validity['status'], "")
+            btn_label = f"{grade_color} {t}"
+            if col.button(btn_label, key=f"tbl_btn_{t}",
+                          type="primary" if is_sel else "secondary",
+                          use_container_width=True):
+                # Toggle: klik ulang untuk tutup
+                if st.session_state['selected_ticker_detail'] == t:
+                    st.session_state['selected_ticker_detail'] = None
+                else:
+                    st.session_state['selected_ticker_detail'] = t
+                st.rerun()
+
+    # ── Detail card untuk ticker yang dipilih ─────────────────────────────
+    sel = st.session_state.get('selected_ticker_detail')
+    if sel and sel in df["Ticker"].values:
+        sel_row = df[df["Ticker"] == sel].iloc[0]
+        with st.container():
+            st.markdown(f"#### 📋 Detail: {sel}")
+            card_html = _render_detail_card_html(sel_row, best_ticker)
+            # Render di kolom tengah agar tidak terlalu lebar
+            _, mid, _ = st.columns([1, 3, 1])
+            with mid:
+                st.markdown(card_html, unsafe_allow_html=True)
+
+    # ── Tabel HTML ─────────────────────────────────────────────────────────
     rows_html = ""
     for _, row in df.iterrows():
         ticker = row["Ticker"]
@@ -1975,16 +2122,17 @@ def render_screening_table(df: pd.DataFrame, best_ticker: str | None = None):
         )
         status  = validity['status']
         is_best = (ticker == best_ticker)
+        is_sel  = (ticker == st.session_state.get('selected_ticker_detail'))
 
-        # Row class
         if is_best:
             row_cls = "best-buy-row"
         elif status == "expired":
             row_cls = "expired-row"
         else:
             row_cls = ""
+        # Highlight selected row
+        sel_style = "outline:2px solid #58a6ff;" if is_sel else ""
 
-        # Score color
         score = row["Score"]
         if score >= 75:
             score_cls = "tbl-score-hi"
@@ -1993,7 +2141,6 @@ def render_screening_table(df: pd.DataFrame, best_ticker: str | None = None):
         else:
             score_cls = "tbl-score-lo"
 
-        # Status label
         if status == "valid":
             status_html = '<span class="tbl-status-valid">● Zona Beli</span>'
         elif status == "waiting":
@@ -2001,30 +2148,25 @@ def render_screening_table(df: pd.DataFrame, best_ticker: str | None = None):
         else:
             status_html = '<span class="tbl-status-expired">⚠ Expired</span>'
 
-        # Grade badge
         grade = row.get("Grade", "C")
         grade_color = {"A": "#3fb950", "B": "#58a6ff", "C": "#db6d28"}.get(grade, "#8b949e")
 
-        # Crown for best buy + stale flag
-        is_stale = row.get("_zone_stale", False)
-        crown = '<span class="tbl-crown">👑 </span>' if is_best else ""
-        stale_flag = ' <span style="color:#db6d28;font-size:0.6rem;font-weight:700;" title="Zona stale >1×ATR dari close">⚡</span>' if is_stale else ""
+        is_stale   = row.get("_zone_stale", False)
+        crown      = '<span class="tbl-crown">👑 </span>' if is_best else ""
+        stale_flag = (' <span style="color:#db6d28;font-size:0.6rem;font-weight:700;"'
+                      ' title="Zona stale >1×ATR dari close">⚡</span>') if is_stale else ""
 
-        # Format numbers
         def fmt(v):
-            try:
-                return f"{int(v):,}".replace(",", ".")
-            except Exception:
-                return str(v)
+            try:    return f"{int(v):,}".replace(",", ".")
+            except: return str(v)
 
         rows_html += (
-            f'<tr class="{row_cls}">'
+            f'<tr class="{row_cls}" style="{sel_style}">'
             f'  <td>{crown}<span class="tbl-ticker">{ticker}</span>{stale_flag}</td>'
             f'  <td><span style="color:{grade_color};font-weight:800;">{grade}</span></td>'
             f'  <td><span class="{score_cls}">{score}</span></td>'
             f'  <td>{status_html}</td>'
             f'  <td style="color:#c9d1d9;font-weight:600;">{fmt(row["Live Price"])}</td>'
-            # Trading Plan highlight columns
             f'  <td><span class="tbl-buy">{fmt(row["Buy Min"])} – {fmt(row["Buy Max"])}</span></td>'
             f'  <td>'
             f'    <span class="tbl-tp">{fmt(row["TP1"])}</span>'
@@ -2043,7 +2185,8 @@ def render_screening_table(df: pd.DataFrame, best_ticker: str | None = None):
             f'  <td style="color:#c9d1d9;">{row["ATR"]}</td>'
             f'  <td style="color:#bc8cff;font-weight:600;">{int(row["Lots"])} Lot</td>'
             f'  <td style="color:#58a6ff;font-size:0.72rem;">{fmt_idr(row["Alokasi (Rp)"])}</td>'
-            f'  <td style="color:#db6d28;font-size:0.68rem;max-width:140px;white-space:normal;text-align:left;">{row["TS Kriteria"]}</td>'
+            f'  <td style="color:#db6d28;font-size:0.68rem;max-width:140px;white-space:normal;'
+            f'text-align:left;">{row["TS Kriteria"]}</td>'
             f'</tr>'
         )
 
@@ -2052,24 +2195,16 @@ def render_screening_table(df: pd.DataFrame, best_ticker: str | None = None):
       <table>
         <thead>
           <tr>
-            <th>Ticker</th>
-            <th>Grade</th>
-            <th>Score</th>
-            <th>Status</th>
+            <th>Ticker</th><th>Grade</th><th>Score</th><th>Status</th>
             <th>Harga Live</th>
             <th class="buy-header">📍 Zona Beli</th>
             <th class="tp-header">🎯 TP 1</th>
             <th class="tp-header">🎯 TP 2</th>
             <th class="sl-header">🛡 Stop Loss</th>
-            <th>ATR</th>
-            <th>Lots</th>
-            <th>Alokasi</th>
-            <th>Trailing Strategy</th>
+            <th>ATR</th><th>Lots</th><th>Alokasi</th><th>Trailing Strategy</th>
           </tr>
         </thead>
-        <tbody>
-          {rows_html}
-        </tbody>
+        <tbody>{rows_html}</tbody>
       </table>
     </div>
     """
