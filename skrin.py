@@ -4,9 +4,21 @@ import numpy as np
 import yfinance as yf
 import re
 import os
+import io
+import base64
+import json
 import concurrent.futures
+import requests
 from datetime import datetime, timedelta
 from functools import lru_cache
+
+# Chart generation
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
 
 # =============================================================================
 # 1. KONFIGURASI HALAMAN & CSS
@@ -94,59 +106,6 @@ st.markdown("""
         text-align:center;
     }
     .dimmed { opacity: 0.35; pointer-events:none; user-select:none; filter:grayscale(60%); }
-    /* Screening Result Table */
-    .screening-table-wrap {
-        overflow-x: auto; margin-top: 1.5rem;
-        border: 1px solid #30363d; border-radius: 10px;
-    }
-    .screening-table-wrap table {
-        width: 100%; border-collapse: collapse;
-        font-size: 0.78rem; color: #c9d1d9;
-    }
-    .screening-table-wrap thead tr {
-        background: #161b22; border-bottom: 2px solid #30363d;
-    }
-    .screening-table-wrap thead th {
-        padding: 0.6rem 0.8rem; text-align: center;
-        font-size: 0.65rem; font-weight: 700; color: #8b949e;
-        text-transform: uppercase; letter-spacing: 0.5px;
-        white-space: nowrap;
-    }
-    .screening-table-wrap thead th.tp-header {
-        color: #3fb950; background: rgba(63,185,80,0.06);
-    }
-    .screening-table-wrap thead th.sl-header {
-        color: #f85149; background: rgba(248,81,73,0.06);
-    }
-    .screening-table-wrap thead th.buy-header {
-        color: #58a6ff; background: rgba(88,166,255,0.06);
-    }
-    .screening-table-wrap tbody tr {
-        border-bottom: 1px solid #21262d; transition: background 0.15s;
-    }
-    .screening-table-wrap tbody tr:last-child { border-bottom: none; }
-    .screening-table-wrap tbody tr:hover { background: rgba(255,255,255,0.03); }
-    .screening-table-wrap tbody tr.best-buy-row {
-        background: rgba(255,215,0,0.05) !important;
-        border-left: 3px solid #ffd700;
-    }
-    .screening-table-wrap tbody tr.expired-row { opacity: 0.45; }
-    .screening-table-wrap tbody td {
-        padding: 0.55rem 0.8rem; text-align: center; vertical-align: middle;
-    }
-    .tbl-ticker { font-weight: 800; color: #58a6ff; font-size: 0.85rem; }
-    .tbl-tp  { font-weight: 700; color: #3fb950; background: rgba(63,185,80,0.08); border-radius: 4px; padding: 0.15rem 0.4rem; }
-    .tbl-sl  { font-weight: 700; color: #f85149; background: rgba(248,81,73,0.08); border-radius: 4px; padding: 0.15rem 0.4rem; }
-    .tbl-buy { font-weight: 700; color: #58a6ff; background: rgba(88,166,255,0.08); border-radius: 4px; padding: 0.15rem 0.4rem; }
-    .tbl-rr  { color: #d2a8ff; font-weight: 600; font-size: 0.7rem; }
-    .tbl-score-hi { color: #3fb950; font-weight: 800; }
-    .tbl-score-md { color: #e3b341; font-weight: 700; }
-    .tbl-score-lo { color: #8b949e; font-weight: 600; }
-    .tbl-status-valid   { color: #3fb950; font-weight: 700; font-size: 0.68rem; }
-    .tbl-status-waiting { color: #e3b341; font-weight: 700; font-size: 0.68rem; }
-    .tbl-status-expired { color: #f85149; font-weight: 700; font-size: 0.68rem; }
-    .tbl-crown { font-size: 0.68rem; }
-
     /* Best Buy highlight */
     .best-buy-card {
         border-color: #ffd700 !important;
@@ -171,7 +130,11 @@ st.markdown("""
 # =============================================================================
 # 2. SESSION STATE
 # =============================================================================
-for key, default in [('raw_market_data', {}), ('last_loaded_mode', None), ('scan_meta', {})]:
+for key, default in [
+    ('raw_market_data', {}), ('last_loaded_mode', None), ('scan_meta', {}),
+    ('vision_cache', {}),    # cache hasil Vision per ticker per hari
+    ('sheets_log', []),      # log sementara sebelum push ke GSheets
+]:
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -350,224 +313,6 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
     }
 
 # =============================================================================
-# 4a. MONTE CARLO PROBABILITY ENGINE
-# =============================================================================
-def monte_carlo_tp_probability(
-    df: pd.DataFrame,
-    entry: float,
-    tp1: float,
-    tp2: float,
-    stop_loss: float,
-    horizon: int = 10,
-    n_sim: int = 5000,
-    lookback: int = 60,
-) -> dict:
-    """
-    Estimasi probabilistik berbasis simulasi Monte Carlo historis per saham.
-
-    Metodologi:
-    - Ambil distribusi log-return harian dari 'lookback' hari terakhir
-    - Simulasikan 'n_sim' jalur harga selama 'horizon' hari
-    - Hitung fraksi simulasi yang menyentuh TP1/TP2 SEBELUM SL ter-trigger
-    - Hitung distribusi hari (P25, median, P75) untuk tiap target
-
-    Output adalah estimasi statistik, BUKAN prediksi pasti.
-    Akurasi bergantung pada asumsi return berdistribusi mirip historis.
-    """
-    if len(df) < lookback + 5:
-        return {'valid': False}
-
-    close = df['Close'].values.astype(float)
-    # Log-return dari lookback hari terakhir
-    hist   = close[-(lookback + 1):]
-    lrets  = np.diff(np.log(hist))          # shape: (lookback,)
-
-    mu     = float(np.mean(lrets))
-    sigma  = float(np.std(lrets, ddof=1))
-
-    if sigma <= 0 or not np.isfinite(mu) or not np.isfinite(sigma):
-        return {'valid': False}
-
-    # ── Simulasi ──────────────────────────────────────────────────────────
-    rng    = np.random.default_rng(seed=42)   # reproducible
-    shocks = rng.normal(mu, sigma, size=(n_sim, horizon))   # (n_sim, horizon)
-    # Harga path: entry × exp(cumsum returns)
-    paths  = entry * np.exp(np.cumsum(shocks, axis=1))      # (n_sim, horizon)
-
-    # ── Per simulasi: cek apakah menyentuh TP/SL ─────────────────────────
-    hit_tp1_day  = np.full(n_sim, np.nan)   # hari pertama TP1 tersentuh
-    hit_tp2_day  = np.full(n_sim, np.nan)
-    hit_sl_day   = np.full(n_sim, np.nan)
-
-    for d in range(horizon):
-        col = paths[:, d]
-        # TP1: belum hit sebelumnya dan belum kena SL
-        mask_tp1 = np.isnan(hit_tp1_day) & np.isnan(hit_sl_day) & (col >= tp1)
-        hit_tp1_day[mask_tp1] = d + 1
-
-        mask_tp2 = np.isnan(hit_tp2_day) & np.isnan(hit_sl_day) & (col >= tp2)
-        hit_tp2_day[mask_tp2] = d + 1
-
-        mask_sl  = np.isnan(hit_sl_day) & (col <= stop_loss)
-        hit_sl_day[mask_sl]  = d + 1
-
-    # ── Probabilitas ──────────────────────────────────────────────────────
-    # TP harus dicapai SEBELUM SL (atau SL tidak pernah kena)
-    tp1_before_sl = (~np.isnan(hit_tp1_day)) & (
-        np.isnan(hit_sl_day) | (hit_tp1_day <= hit_sl_day)
-    )
-    tp2_before_sl = (~np.isnan(hit_tp2_day)) & (
-        np.isnan(hit_sl_day) | (hit_tp2_day <= hit_sl_day)
-    )
-    sl_hit = ~np.isnan(hit_sl_day)
-
-    prob_tp1 = float(np.mean(tp1_before_sl) * 100)
-    prob_tp2 = float(np.mean(tp2_before_sl) * 100)
-    prob_sl  = float(np.mean(sl_hit) * 100)
-
-    # ── Distribusi hari untuk TP1 (hanya simulasi yang berhasil) ──────────
-    tp1_days_valid = hit_tp1_day[tp1_before_sl]
-    if len(tp1_days_valid) >= 10:
-        day_p25    = int(np.percentile(tp1_days_valid, 25))
-        day_median = int(np.percentile(tp1_days_valid, 50))
-        day_p75    = int(np.percentile(tp1_days_valid, 75))
-    else:
-        day_p25 = day_median = day_p75 = None
-
-    # Ekspektasi R/R berbobot probabilitas
-    expected_rr = None
-    if entry > stop_loss:
-        sl_dist  = entry - stop_loss
-        tp1_dist = tp1  - entry
-        tp2_dist = tp2  - entry
-        p1 = prob_tp1 / 100
-        p2 = (prob_tp2 / 100)
-        p_sl = prob_sl / 100
-        # EV sederhana: P(TP1)×gain_tp1 + P(TP2-TP1)×gain_tp2 - P(SL)×sl_dist
-        ev = p1 * tp1_dist + max(p2 - p1, 0) * tp2_dist - p_sl * sl_dist
-        expected_rr = round(ev / sl_dist, 2) if sl_dist > 0 else None
-
-    return {
-        'valid':       True,
-        'prob_tp1':    round(prob_tp1, 1),
-        'prob_tp2':    round(prob_tp2, 1),
-        'prob_sl':     round(prob_sl, 1),
-        'day_p25':     day_p25,
-        'day_median':  day_median,
-        'day_p75':     day_p75,
-        'expected_rr': expected_rr,
-        'n_sim':       n_sim,
-        'lookback':    lookback,
-        'sigma_daily': round(sigma * 100, 2),   # volatilitas harian %
-    }
-
-
-def _render_mc_html(mc: dict, is_expired: bool = False) -> str:
-    """Render blok probabilitas Monte Carlo di dalam kartu."""
-    if not mc.get('valid'):
-        return ''
-
-    prob_tp1 = mc['prob_tp1']
-    prob_tp2 = mc['prob_tp2']
-    prob_sl  = mc['prob_sl']
-    err      = expected_rr = mc.get('expected_rr')
-
-    # Warna probabilitas TP1
-    if prob_tp1 >= 60:
-        c_tp1 = '#3fb950'
-    elif prob_tp1 >= 40:
-        c_tp1 = '#e3b341'
-    else:
-        c_tp1 = '#f85149'
-
-    if prob_tp2 >= 50:
-        c_tp2 = '#3fb950'
-    elif prob_tp2 >= 30:
-        c_tp2 = '#e3b341'
-    else:
-        c_tp2 = '#8b949e'
-
-    c_sl = '#f85149' if prob_sl >= 40 else '#e3b341' if prob_sl >= 20 else '#8b949e'
-
-    # Bar width (cap 100)
-    bw1  = min(int(prob_tp1), 100)
-    bw2  = min(int(prob_tp2), 100)
-    bwsl = min(int(prob_sl),  100)
-
-    # Distribusi hari TP1
-    if mc.get('day_median') is not None:
-        p25, med, p75 = mc['day_p25'], mc['day_median'], mc['day_p75']
-        day_html = (
-            f'<div style="margin-top:0.3rem;display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;">'
-            f'<span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;">Hari ke-TP1</span>'
-            f'<span style="font-size:0.68rem;color:#8b949e;">cepat: <b style="color:#c9d1d9;">{p25}h</b></span>'
-            f'<span style="font-size:0.68rem;color:#e3b341;font-weight:700;">median {med}h</span>'
-            f'<span style="font-size:0.68rem;color:#8b949e;">lambat: <b style="color:#c9d1d9;">{p75}h</b></span>'
-            f'</div>'
-        )
-    else:
-        day_html = '<div style="font-size:0.65rem;color:#8b949e;margin-top:0.2rem;">Simulasi tidak cukup untuk distribusi hari</div>'
-
-    # Expected R/R
-    if err is not None:
-        err_color = '#3fb950' if err > 0 else '#f85149'
-        err_sign  = '+' if err > 0 else ''
-        err_html  = f'<span style="font-size:0.68rem;color:{err_color};font-weight:700;margin-left:0.5rem;">E[R/R] {err_sign}{err}</span>'
-    else:
-        err_html = ''
-
-    opacity = 'opacity:0.4;' if is_expired else ''
-
-    return (
-        f'<div style="border-top:1px solid #21262d;margin-top:0.5rem;padding-top:0.5rem;{opacity}">'
-        f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.35rem;">'
-        f'  <span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px;">Probabilitas Monte Carlo</span>'
-        f'  <span style="font-size:0.6rem;color:#8b949e;">{mc["n_sim"]:,} sim · {mc["lookback"]}h lookback · σ={mc["sigma_daily"]}%/hari</span>'
-        f'</div>'
-
-        # TP1 bar
-        f'<div style="margin-bottom:0.25rem;">'
-        f'  <div style="display:flex;justify-content:space-between;margin-bottom:0.1rem;">'
-        f'    <span style="font-size:0.68rem;color:#8b949e;">P(TP1 sebelum SL)</span>'
-        f'    <span style="font-size:0.72rem;font-weight:800;color:{c_tp1};">{prob_tp1}%{err_html}</span>'
-        f'  </div>'
-        f'  <div style="background:#21262d;border-radius:3px;height:4px;">'
-        f'    <div style="width:{bw1}%;height:4px;border-radius:3px;background:{c_tp1};"></div>'
-        f'  </div>'
-        f'</div>'
-
-        # TP2 bar
-        f'<div style="margin-bottom:0.25rem;">'
-        f'  <div style="display:flex;justify-content:space-between;margin-bottom:0.1rem;">'
-        f'    <span style="font-size:0.68rem;color:#8b949e;">P(TP2 sebelum SL)</span>'
-        f'    <span style="font-size:0.72rem;font-weight:700;color:{c_tp2};">{prob_tp2}%</span>'
-        f'  </div>'
-        f'  <div style="background:#21262d;border-radius:3px;height:4px;">'
-        f'    <div style="width:{bw2}%;height:4px;border-radius:3px;background:{c_tp2};"></div>'
-        f'  </div>'
-        f'</div>'
-
-        # SL bar
-        f'<div style="margin-bottom:0.3rem;">'
-        f'  <div style="display:flex;justify-content:space-between;margin-bottom:0.1rem;">'
-        f'    <span style="font-size:0.68rem;color:#8b949e;">P(kena SL)</span>'
-        f'    <span style="font-size:0.72rem;font-weight:700;color:{c_sl};">{prob_sl}%</span>'
-        f'  </div>'
-        f'  <div style="background:#21262d;border-radius:3px;height:4px;">'
-        f'    <div style="width:{bwsl}%;height:4px;border-radius:3px;background:{c_sl};"></div>'
-        f'  </div>'
-        f'</div>'
-
-        f'{day_html}'
-
-        f'<div style="margin-top:0.35rem;font-size:0.6rem;color:#484f58;font-style:italic;">'
-        f'⚠ Simulasi berbasis return historis, bukan prediksi. Tidak memperhitungkan gap, berita, atau likuiditas.'
-        f'</div>'
-        f'</div>'
-    )
-
-
-# =============================================================================
 # 4b. VOLUME CONTEXT — analisis candle terakhir
 # =============================================================================
 def analyse_volume_context(df: pd.DataFrame) -> dict:
@@ -652,56 +397,41 @@ def analyse_tape(df: pd.DataFrame) -> dict:
     last_range     = ranges5[-1]
     last_body      = abs(cl5[-1] - op5[-1])
     last_close_pos = (cl5[-1] - lo5[-1]) / max(last_range, 1e-9)
-    body_ratio     = last_body / max(last_range, 1e-9)
 
-    if (last_vol_ratio > 2.5 and body_ratio > 0.6
+    if (last_vol_ratio > 2.5 and last_body / max(last_range, 1e-9) > 0.6
             and cl5[-1] > op5[-1] and last_close_pos > 0.7):
-        signals.append({
-            'key': 'buying_climax', 'style': 'distrib',
-            'label': 'Buying Climax', 'short': 'BC',
-            'conf_pct': min(int(last_vol_ratio / 3.0 * 100), 90),
-        })
+        signals.append(('buying_climax', 'distrib',
+                        'Buying Climax', 'BC',
+                        min(int(last_vol_ratio / 3.0 * 100), 90)))
 
     # ── Selling Climax: volume sangat tinggi + bearish besar ──
-    if (last_vol_ratio > 2.5 and body_ratio > 0.6
+    if (last_vol_ratio > 2.5 and last_body / max(last_range, 1e-9) > 0.6
             and cl5[-1] < op5[-1] and last_close_pos < 0.3):
-        signals.append({
-            'key': 'selling_climax', 'style': 'accum',
-            'label': 'Selling Climax', 'short': 'SC',
-            'conf_pct': min(int(last_vol_ratio / 3.0 * 100), 90),
-        })
+        signals.append(('selling_climax', 'accum',
+                        'Selling Climax', 'SC',
+                        min(int(last_vol_ratio / 3.0 * 100), 90)))
 
     # ── Absorption: volume besar tapi harga tidak turun jauh (close_pos tinggi) ──
-    # Guard: tidak overlap dengan Buying Climax (body_ratio > 0.6 + close_pos > 0.7)
-    already_bc = any(s['key'] == 'buying_climax' for s in signals)
-    if (not already_bc and last_vol_ratio > 1.8 and last_close_pos > 0.55
+    if (last_vol_ratio > 1.8 and last_close_pos > 0.55
             and abs(cl5[-1] - cl5[-2]) / max(atr5, 1e-9) < 0.5):
-        signals.append({
-            'key': 'absorption', 'style': 'accum',
-            'label': 'Absorption', 'short': 'ABS',
-            'conf_pct': min(int(last_close_pos * last_vol_ratio / 2.5 * 100), 85),
-        })
+        signals.append(('absorption', 'accum',
+                        'Absorption', 'ABS',
+                        min(int(last_close_pos * last_vol_ratio / 2.5 * 100), 85)))
 
     # ── Exhaustion: volume tinggi tapi range candle kecil ──
     if (last_vol_ratio > 1.8 and last_range < avg_range5 * 0.6):
-        signals.append({
-            'key': 'exhaustion', 'style': 'warn',
-            'label': 'Exhaustion', 'short': 'EXH',
-            'conf_pct': min(int((avg_range5 / max(last_range, 1e-9)) * 20), 80),
-        })
+        signals.append(('exhaustion', 'warn',
+                        'Exhaustion', 'EXH',
+                        min(int((avg_range5 / max(last_range, 1e-9)) * 20), 80)))
 
     # ── Accumulation Quiet: 5 candle volume rendah konsisten, harga tidak turun ──
     vol_consistent_low = all(v < vol_ma * 0.8 for v in vol5)
     price_stable       = (max(cl5) - min(cl5)) / max(atr5, 1e-9) < 1.5
     if vol_consistent_low and price_stable:
-        signals.append({
-            'key': 'accum_quiet', 'style': 'accum',
-            'label': 'Akumulasi Senyap', 'short': 'AQ',
-            'conf_pct': 72,
-        })
+        signals.append(('accum_quiet', 'accum',
+                        'Akumulasi Senyap', 'AQ',
+                        72))
 
-    # FIX: sort by confidence (sama seperti bandarmology)
-    signals.sort(key=lambda x: x['conf_pct'], reverse=True)
     dominant = signals[0] if signals else None
     return {'signals': signals, 'dominant': dominant}
 
@@ -898,6 +628,586 @@ def _build_narasi(signals: list, dominant: dict | None) -> tuple[str, str]:
 
 
 # =============================================================================
+# 4e. CHART GENERATOR — 60m + 1D dengan semua indikator & Auto-Fibonacci
+# =============================================================================
+
+def _calc_macd(close: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast   = close.ewm(span=fast, adjust=False).mean()
+    ema_slow   = close.ewm(span=slow, adjust=False).mean()
+    macd_line  = ema_fast - ema_slow
+    signal_line= macd_line.ewm(span=signal, adjust=False).mean()
+    histogram  = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+def _calc_adx(df: pd.DataFrame, window=14) -> pd.Series:
+    high, low, close = df['High'], df['Low'], df['Close']
+    plus_dm  = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    mask     = plus_dm < minus_dm
+    plus_dm[mask]  = 0
+    minus_dm[~mask]= 0
+    atr      = calculate_atr(df, window)
+    plus_di  = 100 * plus_dm.ewm(alpha=1/window, adjust=False).mean()  / atr.replace(0, 1e-9)
+    minus_di = 100 * minus_dm.ewm(alpha=1/window, adjust=False).mean() / atr.replace(0, 1e-9)
+    dx       = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9))
+    adx      = dx.ewm(alpha=1/window, adjust=False).mean()
+    return adx
+
+def _calc_vwap(df: pd.DataFrame) -> pd.Series:
+    """VWAP harian — reset setiap hari baru. Untuk intraday pakai semua data yang ada."""
+    typical = (df['High'] + df['Low'] + df['Close']) / 3
+    cum_vol  = df['Volume'].cumsum()
+    cum_tp_vol = (typical * df['Volume']).cumsum()
+    return cum_tp_vol / cum_vol.replace(0, np.nan)
+
+def _calc_fibonacci(df: pd.DataFrame, lookback: int = 50) -> dict:
+    """
+    Auto-Fibonacci: ambil swing high & low dari `lookback` candle terakhir.
+    Level: 0, 23.6, 38.2, 50, 61.8, 78.6, 100
+    """
+    tail  = df.tail(lookback)
+    swing_high = float(tail['High'].max())
+    swing_low  = float(tail['Low'].min())
+    diff = swing_high - swing_low
+    levels = {
+        '0%':    swing_high,
+        '23.6%': swing_high - 0.236 * diff,
+        '38.2%': swing_high - 0.382 * diff,
+        '50%':   swing_high - 0.500 * diff,
+        '61.8%': swing_high - 0.618 * diff,
+        '78.6%': swing_high - 0.786 * diff,
+        '100%':  swing_low,
+    }
+    return levels
+
+def _calc_bb(close: pd.Series, window=20, std_mult=2.0):
+    basis  = close.rolling(window).mean()
+    std    = close.rolling(window).std(ddof=1)
+    upper  = basis + std_mult * std
+    lower  = basis - std_mult * std
+    return upper, basis, lower
+
+def generate_chart(df: pd.DataFrame, ticker: str, timeframe_label: str,
+                   trade_plan: dict | None = None) -> bytes:
+    """
+    Buat chart lengkap 4 panel:
+    Panel 1 (besar): Candlestick + EMA20 + EMA50 + BB + VWAP + Auto-Fibonacci + TP/SL
+    Panel 2: Volume bar + Vol MA
+    Panel 3: RSI(14) + garis 30/70
+    Panel 4: MACD histogram + signal
+
+    Kembalikan PNG sebagai bytes (untuk Vision API dan display Streamlit).
+    """
+    if len(df) < 30:
+        return b''
+
+    # ── Hitung semua indikator ─────────────────────────────────────────────
+    close  = df['Close']
+    n      = min(100, len(df))   # maks 100 candle terakhir
+    df_plot= df.tail(n).copy().reset_index()
+    idx    = np.arange(len(df_plot))
+
+    c      = df_plot['Close'].values
+    o      = df_plot['Open'].values
+    h      = df_plot['High'].values
+    l      = df_plot['Low'].values
+    v      = df_plot['Volume'].values
+
+    ema20  = df_plot['Close'].ewm(span=20, adjust=False).mean().values
+    ema50  = df_plot['Close'].ewm(span=50, adjust=False).mean().values
+    bb_u, bb_m, bb_l = _calc_bb(df_plot['Close'])
+    vwap   = _calc_vwap(df_plot).values
+    macd_l, macd_s, macd_h = _calc_macd(df_plot['Close'])
+    rsi    = calculate_rsi(df_plot)
+    adx    = _calc_adx(df_plot)
+    fib    = _calc_fibonacci(df_plot)
+    vol_ma = df_plot['Volume'].rolling(20).mean().values
+
+    # ── Setup figure ───────────────────────────────────────────────────────
+    BG    = '#0d1117'; PANEL = '#161b22'; GRID = '#21262d'
+    GREEN = '#3fb950'; RED   = '#f85149'; BLUE = '#58a6ff'
+    GOLD  = '#ffd700'; PURP  = '#bc8cff'; ORNG = '#db6d28'
+
+    fig = plt.figure(figsize=(16, 11), facecolor=BG)
+    gs  = GridSpec(4, 1, figure=fig,
+                   height_ratios=[5, 1.2, 1.2, 1.2],
+                   hspace=0.06, top=0.94, bottom=0.05, left=0.06, right=0.97)
+
+    ax1 = fig.add_subplot(gs[0])   # candlestick
+    ax2 = fig.add_subplot(gs[1], sharex=ax1)   # volume
+    ax3 = fig.add_subplot(gs[2], sharex=ax1)   # RSI
+    ax4 = fig.add_subplot(gs[3], sharex=ax1)   # MACD
+
+    for ax in [ax1, ax2, ax3, ax4]:
+        ax.set_facecolor(PANEL)
+        ax.tick_params(colors='#8b949e', labelsize=7)
+        ax.spines[:].set_color(GRID)
+        ax.yaxis.set_label_position('right')
+        ax.yaxis.tick_right()
+
+    # ── Panel 1: Candlestick ───────────────────────────────────────────────
+    W  = 0.6
+    for i in idx:
+        bull = c[i] >= o[i]
+        col  = GREEN if bull else RED
+        # Wick
+        ax1.plot([i, i], [l[i], h[i]], color=col, linewidth=0.8, zorder=2)
+        # Body
+        y0 = min(o[i], c[i]); y1 = max(o[i], c[i])
+        ax1.add_patch(mpatches.FancyBboxPatch(
+            (i - W/2, y0), W, max(y1 - y0, (h[i]-l[i])*0.01),
+            boxstyle="square,pad=0", facecolor=col,
+            edgecolor=col, linewidth=0, zorder=3
+        ))
+
+    # EMA & BB
+    ax1.plot(idx, ema20, color=BLUE,  linewidth=1.0, label='EMA20', zorder=4)
+    ax1.plot(idx, ema50, color=GOLD,  linewidth=1.0, label='EMA50', zorder=4)
+    ax1.plot(idx, bb_u.values, color='#8b949e', linewidth=0.6, linestyle='--', label='BB', zorder=4)
+    ax1.plot(idx, bb_m.values, color='#8b949e', linewidth=0.5, linestyle=':', zorder=4)
+    ax1.plot(idx, bb_l.values, color='#8b949e', linewidth=0.6, linestyle='--', zorder=4)
+    ax1.fill_between(idx, bb_u.values, bb_l.values, alpha=0.04, color='#8b949e')
+
+    # VWAP
+    ax1.plot(idx, vwap, color=PURP, linewidth=1.0, linestyle='-.', label='VWAP', zorder=4)
+
+    # Auto-Fibonacci
+    fib_colors = {'0%':'#3fb950','23.6%':'#58a6ff','38.2%':'#e3b341',
+                  '50%':'#ffd700','61.8%':'#e3b341','78.6%':'#f85149','100%':'#f85149'}
+    for level_name, level_price in fib.items():
+        ax1.axhline(level_price, color=fib_colors[level_name],
+                    linewidth=0.5, linestyle=':', alpha=0.7, zorder=1)
+        ax1.text(idx[-1] + 0.3, level_price, f' Fib {level_name}',
+                 color=fib_colors[level_name], fontsize=5.5, va='center', alpha=0.85)
+
+    # TP / SL overlay
+    if trade_plan:
+        sl = trade_plan.get('stop_loss'); tp1 = trade_plan.get('tp1'); tp2 = trade_plan.get('tp2')
+        if sl:  ax1.axhline(sl,  color=RED,   linewidth=1.2, linestyle='--', alpha=0.9, zorder=5)
+        if tp1: ax1.axhline(tp1, color=GREEN, linewidth=1.2, linestyle='--', alpha=0.9, zorder=5)
+        if tp2: ax1.axhline(tp2, color=GREEN, linewidth=0.8, linestyle=':', alpha=0.7, zorder=5)
+        if sl:  ax1.text(0.5, sl,  f' SL {int(sl):,}'.replace(',','.'),  color=RED,   fontsize=6.5, va='bottom')
+        if tp1: ax1.text(0.5, tp1, f' TP1 {int(tp1):,}'.replace(',','.'), color=GREEN, fontsize=6.5, va='bottom')
+        if tp2: ax1.text(0.5, tp2, f' TP2 {int(tp2):,}'.replace(',','.'), color=GREEN, fontsize=6.5, va='bottom')
+
+    # ADX annotation
+    adx_val = float(adx.iloc[-1]) if len(adx) > 0 else 0
+    adx_col = GREEN if adx_val >= 25 else '#8b949e'
+    ax1.text(0.01, 0.98, f'ADX {adx_val:.1f}', transform=ax1.transAxes,
+             color=adx_col, fontsize=7, va='top', fontweight='bold')
+
+    # Legend
+    legend_elements = [
+        Line2D([0],[0], color=BLUE,  lw=1.2, label='EMA20'),
+        Line2D([0],[0], color=GOLD,  lw=1.2, label='EMA50'),
+        Line2D([0],[0], color=PURP,  lw=1.2, linestyle='-.', label='VWAP'),
+        Line2D([0],[0], color='#8b949e', lw=0.8, linestyle='--', label='BB'),
+    ]
+    ax1.legend(handles=legend_elements, loc='upper left', fontsize=6.5,
+               facecolor=PANEL, edgecolor=GRID, labelcolor='#c9d1d9', framealpha=0.9)
+
+    ax1.set_title(f'{ticker}  ·  {timeframe_label}  ·  {datetime.now().strftime("%d %b %Y %H:%M")} WIB',
+                  color='#c9d1d9', fontsize=9.5, fontweight='bold', loc='left', pad=6)
+    ax1.set_ylabel('Harga (Rp)', color='#8b949e', fontsize=7)
+    ax1.grid(True, color=GRID, linewidth=0.4, alpha=0.6)
+
+    # ── Panel 2: Volume ────────────────────────────────────────────────────
+    vol_colors = [GREEN if c[i] >= o[i] else RED for i in idx]
+    ax2.bar(idx, v, color=vol_colors, alpha=0.75, width=0.7, zorder=3)
+    ax2.plot(idx, vol_ma, color=GOLD, linewidth=0.9, label='Vol MA20', zorder=4)
+    ax2.set_ylabel('Vol', color='#8b949e', fontsize=7)
+    ax2.grid(True, color=GRID, linewidth=0.3, alpha=0.5)
+    ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x/1e6:.0f}M'))
+
+    # ── Panel 3: RSI ───────────────────────────────────────────────────────
+    rsi_vals = rsi.values
+    ax3.plot(idx, rsi_vals, color=PURP, linewidth=1.0, zorder=3)
+    ax3.fill_between(idx, rsi_vals, 70, where=(rsi_vals > 70), alpha=0.25, color=RED)
+    ax3.fill_between(idx, rsi_vals, 30, where=(rsi_vals < 30), alpha=0.25, color=GREEN)
+    ax3.axhline(70, color=RED,      linewidth=0.6, linestyle='--', alpha=0.7)
+    ax3.axhline(50, color='#8b949e',linewidth=0.4, linestyle=':', alpha=0.5)
+    ax3.axhline(30, color=GREEN,    linewidth=0.6, linestyle='--', alpha=0.7)
+    ax3.set_ylim(0, 100); ax3.set_ylabel('RSI', color='#8b949e', fontsize=7)
+    ax3.text(idx[-1], float(rsi_vals[-1]), f' {rsi_vals[-1]:.1f}',
+             color=PURP, fontsize=6.5, va='center')
+    ax3.grid(True, color=GRID, linewidth=0.3, alpha=0.5)
+
+    # ── Panel 4: MACD ──────────────────────────────────────────────────────
+    hist_colors = [GREEN if v >= 0 else RED for v in macd_h.values]
+    ax4.bar(idx, macd_h.values, color=hist_colors, alpha=0.7, width=0.7, zorder=3)
+    ax4.plot(idx, macd_l.values, color=BLUE,  linewidth=0.9, label='MACD', zorder=4)
+    ax4.plot(idx, macd_s.values, color=ORNG,  linewidth=0.9, label='Signal', zorder=4)
+    ax4.axhline(0, color='#8b949e', linewidth=0.4, alpha=0.6)
+    ax4.set_ylabel('MACD', color='#8b949e', fontsize=7)
+    ax4.legend(loc='upper left', fontsize=5.5, facecolor=PANEL,
+               edgecolor=GRID, labelcolor='#c9d1d9', framealpha=0.9)
+    ax4.grid(True, color=GRID, linewidth=0.3, alpha=0.5)
+
+    # ── X-axis labels (tanggal/jam) ────────────────────────────────────────
+    plt.setp(ax1.get_xticklabels(), visible=False)
+    plt.setp(ax2.get_xticklabels(), visible=False)
+    plt.setp(ax3.get_xticklabels(), visible=False)
+    date_col = df_plot.columns[0]  # index setelah reset_index
+    tick_step = max(1, n // 10)
+    tick_idx  = idx[::tick_step]
+    tick_lbl  = []
+    for ti in tick_idx:
+        try:
+            dt = pd.to_datetime(df_plot[date_col].iloc[ti])
+            fmt = '%H:%M' if 'h' in timeframe_label.lower() else '%d/%m'
+            tick_lbl.append(dt.strftime(fmt))
+        except Exception:
+            tick_lbl.append('')
+    ax4.set_xticks(tick_idx)
+    ax4.set_xticklabels(tick_lbl, fontsize=6.5, color='#8b949e')
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=130, bbox_inches='tight', facecolor=BG)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def generate_charts_for_ticker(ticker_jk: str, df_daily: pd.DataFrame,
+                                trade_plan: dict | None = None) -> dict[str, bytes]:
+    """
+    Generate dua chart:
+    - '1D'  : data harian  (df_daily, sudah ada)
+    - '60m' : download intraday 60m terpisah
+    Kembalikan dict {'1D': bytes, '60m': bytes}
+    """
+    charts = {}
+    ticker_clean = ticker_jk.split('.')[0]
+
+    # Chart 1D
+    if len(df_daily) >= 30:
+        charts['1D'] = generate_chart(df_daily, ticker_clean, '1 Hari', trade_plan)
+
+    # Chart 60m — download on-demand
+    try:
+        start = (datetime.now() - timedelta(days=25)).strftime('%Y-%m-%d')
+        df_60m = yf.download(ticker_jk, start=start, interval='60m',
+                             auto_adjust=True, progress=False, timeout=20)
+        if not df_60m.empty and len(df_60m) >= 20:
+            charts['60m'] = generate_chart(df_60m, ticker_clean, '60 Menit', trade_plan)
+    except Exception:
+        pass
+
+    return charts
+
+
+# =============================================================================
+# 4f. CLAUDE VISION AGENT — baca chart, output BUY / WATCHLIST / IGNORE
+# =============================================================================
+
+VISION_SYSTEM_PROMPT = """Kamu adalah Strategy Agent untuk saham IDX (Bursa Efek Indonesia).
+Kamu menerima dua chart teknikal (timeframe 60 menit dan 1 Hari) beserta data indikator.
+Tugasmu: analisis secara visual dan tentukan keputusan trading.
+
+Output HARUS dalam JSON valid (tidak ada teks lain, tidak ada markdown fence):
+{
+  "keputusan": "BUY" | "WATCHLIST" | "IGNORE",
+  "confidence": 0-100,
+  "alasan_singkat": "1 kalimat max 20 kata",
+  "analisis": {
+    "trend": "bullish|sideways|bearish",
+    "momentum": "kuat|lemah|divergen",
+    "volume_konfirmasi": true|false,
+    "level_kunci": "deskripsi support/resistance penting",
+    "risiko_utama": "deskripsi risiko terbesar"
+  },
+  "timeframe_alignment": "ya|tidak|parsial"
+}
+
+Kriteria keputusan:
+- BUY: trend naik di kedua TF, volume konfirmasi, RSI tidak overbought (≤70), MACD positif atau cross up, harga di atas EMA20/50
+- WATCHLIST: setup hampir siap tapi belum semua konfirmasi terpenuhi, atau sideways dengan potensi breakout
+- IGNORE: trend turun jelas, atau sinyal mixed/kontradiktif antar TF, atau overbought ekstrem
+"""
+
+def call_vision_agent(charts: dict[str, bytes], indicator_summary: str,
+                      anthropic_api_key: str) -> dict:
+    """
+    Kirim chart ke Claude Vision melalui Anthropic Messages API.
+    Kembalikan dict hasil parsing JSON dari model.
+    """
+    if not charts or not anthropic_api_key:
+        return {'keputusan': 'IGNORE', 'confidence': 0,
+                'alasan_singkat': 'Tidak ada chart atau API key.',
+                'analisis': {}, 'timeframe_alignment': 'tidak'}
+
+    # Bangun content blocks — kirim semua chart yang tersedia
+    content = []
+    for tf_label, chart_bytes in charts.items():
+        if chart_bytes:
+            b64 = base64.standard_b64encode(chart_bytes).decode('utf-8')
+            content.append({
+                "type": "text",
+                "text": f"Chart timeframe {tf_label}:"
+            })
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": b64}
+            })
+
+    content.append({
+        "type": "text",
+        "text": f"Data indikator tambahan:\n{indicator_summary}\n\nBerikan keputusan dalam format JSON."
+    })
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         anthropic_api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      "claude-sonnet-4-20250514",
+                "max_tokens": 600,
+                "system":     VISION_SYSTEM_PROMPT,
+                "messages":   [{"role": "user", "content": content}],
+            },
+            timeout=45
+        )
+        resp.raise_for_status()
+        raw_text = resp.json()['content'][0]['text'].strip()
+        # Strip markdown fence jika ada
+        raw_text = re.sub(r'^```[a-z]*\n?', '', raw_text)
+        raw_text = re.sub(r'\n?```$', '', raw_text)
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        return {'keputusan': 'IGNORE', 'confidence': 0,
+                'alasan_singkat': 'Gagal parse JSON dari Vision.', 'analisis': {}, 'timeframe_alignment': 'tidak'}
+    except Exception as e:
+        return {'keputusan': 'IGNORE', 'confidence': 0,
+                'alasan_singkat': f'Error API: {str(e)[:60]}', 'analisis': {}, 'timeframe_alignment': 'tidak'}
+
+
+def build_indicator_summary(ind: dict, row: pd.Series) -> str:
+    """Ringkasan indikator dalam teks untuk dikirim ke Vision Agent."""
+    return (
+        f"Ticker: {row.get('Ticker','?')} | Score: {row.get('Score','?')} | Grade: {row.get('Grade','?')}\n"
+        f"Harga: {row.get('Live Price','?')} | Zona Beli: {row.get('Buy Min','?')}–{row.get('Buy Max','?')}\n"
+        f"RSI: {ind.get('rsi_val','?'):.1f} | CMF: {ind.get('cmf_val','?'):.3f} | "
+        f"ATR: {ind.get('atr_val','?'):.1f} | Vol Spike: {ind.get('vol_spike','?'):.2f}×\n"
+        f"EMA50: {'Di atas' if ind.get('above_ema50') else 'Di bawah'} | "
+        f"EMA20: {'Di atas' if ind.get('above_ema20') else 'Di bawah'} | "
+        f"Squeeze: {'Ya' if ind.get('in_squeeze') else 'Tidak'}\n"
+        f"TP1: {row.get('TP1','?')} ({row.get('Upside TP1','?')}) | "
+        f"TP2: {row.get('TP2','?')} ({row.get('Upside TP2','?')}) | "
+        f"SL: {row.get('Stop Loss','?')} ({row.get('Risk%','?')})"
+    )
+
+
+# =============================================================================
+# 4g. TELEGRAM NOTIFIER
+# =============================================================================
+
+def send_telegram(bot_token: str, chat_id: str, message: str,
+                  photo_bytes: bytes | None = None) -> bool:
+    """
+    Kirim pesan teks + opsional foto ke Telegram.
+    Kembalikan True jika sukses.
+    """
+    if not bot_token or not chat_id:
+        return False
+    base_url = f"https://api.telegram.org/bot{bot_token}"
+    try:
+        if photo_bytes:
+            resp = requests.post(
+                f"{base_url}/sendPhoto",
+                data={"chat_id": chat_id, "caption": message,
+                      "parse_mode": "HTML"},
+                files={"photo": ("chart.png", photo_bytes, "image/png")},
+                timeout=20
+            )
+        else:
+            resp = requests.post(
+                f"{base_url}/sendMessage",
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+                timeout=15
+            )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def build_telegram_message(row: pd.Series, vision_result: dict) -> str:
+    """Format pesan sinyal untuk Telegram VIP grup."""
+    keputusan = vision_result.get('keputusan', 'IGNORE')
+    conf      = vision_result.get('confidence', 0)
+    alasan    = vision_result.get('alasan_singkat', '—')
+    analisis  = vision_result.get('analisis', {})
+
+    emoji_map = {'BUY': '🟢', 'WATCHLIST': '🟡', 'IGNORE': '🔴'}
+    emoji = emoji_map.get(keputusan, '⚪')
+
+    validity = _check_signal_validity(
+        row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"]
+    )
+    status_label = {"valid": "✅ Siap Entry", "waiting": "⏳ Tunggu", "expired": "🚫 Expired"}[validity['status']]
+
+    msg = (
+        f"{emoji} <b>SINYAL {keputusan}</b> — <b>{row['Ticker']}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Score: <b>{row['Score']}</b> (Grade {row['Grade']}) | Confidence AI: <b>{conf}%</b>\n"
+        f"📍 Status: {status_label}\n\n"
+        f"💰 <b>Level Trading:</b>\n"
+        f"  Harga Skrg : Rp {int(row['Live Price']):,}\n"
+        f"  Zona Beli  : Rp {int(row['Buy Min']):,} – Rp {int(row['Buy Max']):,}\n"
+        f"  TP1        : Rp {int(row['TP1']):,} ({row['Upside TP1']})\n"
+        f"  TP2        : Rp {int(row['TP2']):,} ({row['Upside TP2']})\n"
+        f"  Stop Loss  : Rp {int(row['Stop Loss']):,} ({row['Risk%']})\n"
+        f"  R/R        : {row['R/R TP1']} → {row['R/R TP2']}\n\n"
+        f"🤖 <b>Analisis AI:</b>\n"
+        f"  {alasan}\n"
+        f"  Trend: {analisis.get('trend','—')} | Momentum: {analisis.get('momentum','—')}\n"
+        f"  Vol Konfirmasi: {'✅' if analisis.get('volume_konfirmasi') else '❌'} | "
+        f"TF Alignment: {vision_result.get('timeframe_alignment','—')}\n"
+        f"  Risiko: {analisis.get('risiko_utama','—')}\n\n"
+        f"⏰ {datetime.now().strftime('%d %b %Y %H:%M')} WIB\n"
+        f"<i>Generated by IDX Screener Ultra</i>"
+    ).replace(",", ".")
+    return msg
+
+
+# =============================================================================
+# 4h. GOOGLE SHEETS LOGGER
+# =============================================================================
+
+def append_to_gsheets(sheet_url: str, row: pd.Series,
+                       vision_result: dict, gsheets_api_key: str) -> bool:
+    """
+    Append satu baris sinyal ke Google Sheets via Google Sheets API v4.
+    sheet_url: URL spreadsheet (harus dibagikan ke service account atau publik edit).
+
+    Untuk setup mudah tanpa service account, gunakan Make.com / Zapier webhook
+    atau Apps Script Web App — kirim POST JSON ke webhook URL.
+
+    Di sini implementasi via Apps Script webhook (lebih mudah untuk pengguna awam).
+    """
+    if not sheet_url or not sheet_url.startswith('https://'):
+        return False
+
+    payload = {
+        "timestamp":   datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "ticker":      row.get('Ticker', ''),
+        "score":       row.get('Score', ''),
+        "grade":       row.get('Grade', ''),
+        "live_price":  row.get('Live Price', ''),
+        "buy_min":     row.get('Buy Min', ''),
+        "buy_max":     row.get('Buy Max', ''),
+        "tp1":         row.get('TP1', ''),
+        "tp2":         row.get('TP2', ''),
+        "stop_loss":   row.get('Stop Loss', ''),
+        "rr_tp1":      row.get('R/R TP1', ''),
+        "lots":        row.get('Lots', ''),
+        "alokasi":     row.get('Alokasi (Rp)', ''),
+        "keputusan":   vision_result.get('keputusan', ''),
+        "confidence":  vision_result.get('confidence', ''),
+        "alasan":      vision_result.get('alasan_singkat', ''),
+        "trend":       vision_result.get('analisis', {}).get('trend', ''),
+        "momentum":    vision_result.get('analisis', {}).get('momentum', ''),
+    }
+
+    try:
+        resp = requests.post(sheet_url, json=payload, timeout=15)
+        return resp.status_code in (200, 201)
+    except Exception:
+        return False
+
+
+# =============================================================================
+# 4i. RENDER VISION RESULT CARD (dalam expander di dalam kartu)
+# =============================================================================
+
+def render_vision_section(ticker: str, vision_result: dict,
+                           charts: dict[str, bytes],
+                           bot_token: str, chat_id: str,
+                           sheet_url: str, row: pd.Series):
+    """
+    Render hasil Vision Agent dalam expander di bawah kartu ticker.
+    Tampilkan: keputusan, confidence bar, analisis, chart preview, tombol kirim.
+    """
+    keputusan = vision_result.get('keputusan', 'IGNORE')
+    conf      = vision_result.get('confidence', 0)
+    alasan    = vision_result.get('alasan_singkat', '—')
+    analisis  = vision_result.get('analisis', {})
+
+    color_map = {'BUY': '#3fb950', 'WATCHLIST': '#e3b341', 'IGNORE': '#f85149'}
+    emoji_map = {'BUY': '🟢', 'WATCHLIST': '🟡', 'IGNORE': '🔴'}
+    col = color_map.get(keputusan, '#8b949e')
+
+    with st.expander(f"{emoji_map.get(keputusan,'')} AI Vision — {keputusan} ({conf}%)", expanded=False):
+        # Keputusan badge besar
+        st.markdown(
+            f'<div style="text-align:center;padding:0.6rem;background:rgba(0,0,0,0.2);'
+            f'border-radius:8px;border:1px solid {col};margin-bottom:0.6rem;">'
+            f'<span style="font-size:1.4rem;font-weight:900;color:{col};">{keputusan}</span>'
+            f'<span style="color:#8b949e;font-size:0.75rem;margin-left:0.5rem;">confidence {conf}%</span>'
+            f'</div>', unsafe_allow_html=True
+        )
+
+        # Confidence bar
+        st.progress(conf / 100)
+
+        # Alasan singkat
+        st.markdown(f'*"{alasan}"*')
+
+        # Detail analisis
+        if analisis:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"**Trend:** {analisis.get('trend','—')}")
+                st.markdown(f"**Momentum:** {analisis.get('momentum','—')}")
+                st.markdown(f"**Vol Konfirmasi:** {'✅' if analisis.get('volume_konfirmasi') else '❌'}")
+            with c2:
+                st.markdown(f"**TF Alignment:** {vision_result.get('timeframe_alignment','—')}")
+                st.markdown(f"**Level Kunci:** {analisis.get('level_kunci','—')}")
+                st.markdown(f"**Risiko:** {analisis.get('risiko_utama','—')}")
+
+        # Chart preview tabs
+        if charts:
+            tf_keys = list(charts.keys())
+            if len(tf_keys) > 1:
+                tabs = st.tabs([f"📈 Chart {k}" for k in tf_keys])
+                for tab, key in zip(tabs, tf_keys):
+                    with tab:
+                        if charts[key]:
+                            st.image(charts[key], use_container_width=True)
+            else:
+                key = tf_keys[0]
+                if charts[key]:
+                    st.image(charts[key], use_container_width=True)
+
+        st.markdown("---")
+
+        # Aksi
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button(f"📨 Kirim ke Telegram", key=f"tg_{ticker}",
+                         disabled=not (bot_token and chat_id)):
+                msg        = build_telegram_message(row, vision_result)
+                photo_bytes= charts.get('1D') or charts.get('60m')
+                ok         = send_telegram(bot_token, chat_id, msg, photo_bytes)
+                if ok:
+                    st.success("✅ Terkirim ke Telegram!")
+                else:
+                    st.error("❌ Gagal kirim — cek bot token & chat ID di sidebar.")
+
+        with col2:
+            if st.button(f"📊 Log ke Sheets", key=f"gs_{ticker}",
+                         disabled=not sheet_url):
+                ok = append_to_gsheets(sheet_url, row, vision_result, '')
+                if ok:
+                    st.success("✅ Tercatat di Google Sheets!")
+                else:
+                    st.error("❌ Gagal — cek Sheets webhook URL di sidebar.")
+
+
+# =============================================================================
 # 5. SCORING ENGINE (5 KOMPONEN BERBOBOT)
 # =============================================================================
 # Bobot total = 100 poin
@@ -924,16 +1234,17 @@ def score_trend(ind: dict) -> tuple[float, str]:
 def score_rsi(ind: dict) -> tuple[float, str]:
     """
     B. RSI 14.
-    - Zona ideal setup: 40–65 → base 15pt, bonus +5 jika rising → maks 20pt
-    - RSI > 75 = overbought → penalty 2pt
-    - FIX: base 15 (bukan 20) agar bonus rsi_rising benar-benar aktif
+    - Zona ideal setup: 40–65
+    - RSI > 75 = overbought → penalty
+    - FIX #8: Base 20 + bonus 5 bisa melebihi cap 20 — dibatasi min() sudah benar
+              tapi logika bonus harusnya hanya aktif di zona sweet spot.
     """
     rsi = ind['rsi_val']
     if rsi > 75:
         return 2.0, "bear"
     elif 40 <= rsi <= 65:
         bonus = 5.0 if ind['rsi_rising'] else 0.0
-        return min(15.0 + bonus, 20.0), "bull"   # 15 base + 5 rising bonus = maks 20
+        return min(20.0 + bonus, 20.0), "bull"   # bonus tidak pernah membuat > 20
     elif 65 < rsi <= 75:
         return 10.0, "neut"
     elif 30 <= rsi < 40:
@@ -1166,85 +1477,6 @@ def fetch_live_prices(tickers_jk: list, max_workers: int = 8) -> dict:
     return result
 
 # =============================================================================
-# 7c. STOCK QUALITY FILTER — skip suspend/FCA/zombie/tidur/tidak potensial
-# =============================================================================
-def is_tradeable_stock(ticker: str, df: pd.DataFrame) -> tuple[bool, str]:
-    """
-    Filter pre-engine: cek apakah saham layak untuk diproses lebih lanjut.
-
-    Kategori yang di-skip:
-    1. SUSPENDED / FCA — harga freeze panjang atau volume mati total
-    2. ZOMBIE — harga < 50 (penny stock IDX), terlalu mudah dimanipulasi
-    3. TIDUR (ILLIQUID) — median volume 0 atau candle identik berhari-hari
-    4. HARGA STAGNANT — std deviation harga sangat kecil, saham tidak bergerak
-    5. DATA TIPIS — terlalu banyak NaN atau candle tidak lengkap
-    6. VOLUME MATI — banyak hari dengan volume 0 (de facto suspended)
-    7. SPREAD EKSTREM — High-Low harian terlalu kecil terus-menerus (fake market)
-    8. CANDLE IDENTIK — harga close sama persis N hari berturut-turut (suspended)
-
-    Return: (True, "") jika layak, (False, alasan) jika tidak layak.
-    """
-    if df is None or len(df) < 20:
-        return False, "data kurang dari 20 candle"
-
-    close  = df['Close'].values.astype(float)
-    volume = df['Volume'].values.astype(float)
-    high   = df['High'].values.astype(float)
-    low    = df['Low'].values.astype(float)
-
-    last_close = float(close[-1])
-
-    # ── 1. Zombie: harga < 50 ────────────────────────────────────────────
-    if last_close < 50:
-        return False, f"zombie — harga {last_close:.0f} < 50"
-
-    # ── 2. Candle identik berturut-turut (suspended/freeze) ──────────────
-    # Cek 10 hari terakhir: jika 7+ hari close persis sama → suspended
-    recent_close = close[-10:]
-    unique_prices = len(set(np.round(recent_close, 0)))
-    if unique_prices <= 2:
-        return False, f"suspended/freeze — hanya {unique_prices} harga unik dalam 10 hari"
-
-    # ── 3. Volume mati: banyak hari volume = 0 ───────────────────────────
-    recent_vol = volume[-20:]
-    zero_vol_days = int(np.sum(recent_vol == 0))
-    if zero_vol_days >= 8:
-        return False, f"volume mati — {zero_vol_days}/20 hari volume 0"
-
-    # ── 4. Median volume terlalu rendah (saham tidur) ────────────────────
-    median_vol = float(np.median(recent_vol[recent_vol > 0])) if np.any(recent_vol > 0) else 0
-    if median_vol < 5_000:
-        return False, f"tidur — median volume {median_vol:,.0f} lot/hari"
-
-    # ── 5. Harga stagnant: std price sangat kecil relatif terhadap harga ─
-    price_std = float(np.std(close[-20:]))
-    price_cv  = price_std / max(last_close, 1)   # coefficient of variation
-    if price_cv < 0.005:   # std < 0.5% dari harga → nyaris tidak bergerak
-        return False, f"stagnant — CV harga {price_cv*100:.3f}% < 0.5%"
-
-    # ── 6. Spread H-L terlalu kecil: saham tidur / fake market ───────────
-    hl_range  = high - low
-    median_hl = float(np.median(hl_range[-20:]))
-    if median_hl < 1.0:   # spread < 1 rupiah median (tick size IDX minimum)
-        return False, f"spread ekstrem — median H-L {median_hl:.1f} < 1 rupiah"
-
-    # ── 7. FCA / UMA proxy: harga naik/turun >35% dalam 5 hari ──────────
-    # FCA biasanya diikuti freeze — tapi kalau masih bisa bergerak,
-    # lebih aman skip karena volatilitas ekstrem tidak bisa dikalkulasi normal
-    if len(close) >= 6:
-        ret_5d = (close[-1] - close[-6]) / max(close[-6], 1)
-        if abs(ret_5d) > 0.35:
-            return False, f"FCA/UMA — return 5h {ret_5d*100:.1f}% ekstrem"
-
-    # ── 8. Data NaN berlebihan ───────────────────────────────────────────
-    nan_ratio = float(np.mean(~np.isfinite(close)))
-    if nan_ratio > 0.15:
-        return False, f"data rusak — {nan_ratio*100:.0f}% NaN"
-
-    return True, ""
-
-
-# =============================================================================
 # 8. MAIN STRATEGY ENGINE
 # =============================================================================
 def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd.DataFrame:
@@ -1269,12 +1501,6 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
 
         df = df.copy()
 
-        # ── Quality filter: skip suspend/FCA/zombie/tidur/tidak potensial ──
-        tradeable, reason = is_tradeable_stock(ticker, df)
-        if not tradeable:
-            skipped_reason[ticker] = reason
-            continue
-
         try:
             ind = calculate_indicators(df)
         except Exception as e:
@@ -1298,11 +1524,9 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             skipped_reason[ticker] = f"score {total_score} < threshold"
             continue
 
-        # Grade dinamis: threshold atas = 80, B = threshold+5 s/d 79, C = threshold s/d threshold+4
-        thresh = config['min_score_threshold']
         if total_score >= 80:
             grade = "A"
-        elif total_score >= max(65.0, thresh + 5):
+        elif total_score >= 65:
             grade = "B"
         else:
             grade = "C"
@@ -1320,21 +1544,10 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         buy_min = int(np.floor(last_close - 0.5 * ind['atr_val']))
         buy_max = int(np.ceil(last_close + 0.3 * ind['atr_val']))
 
-        # FIX #15: buy_min tidak boleh < stop_loss
+        # FIX #15: buy_min tidak boleh < stop_loss (entry di bawah SL tidak logis)
         buy_min = max(buy_min, int(stop_loss) + 1)
-        # FIX: buy_max tidak boleh < buy_min (edge case ATR kecil + SL dekat)
-        buy_max = max(buy_max, buy_min + max(1, int(ind['atr_val'] * 0.1)))
 
-        # ── Monte Carlo probability (entry = buy_max worst-case) ──────────
-        mc_horizon = 15 if trading_mode == "Intraday (Fast Trade)" else 20
-        mc = monte_carlo_tp_probability(
-            df, entry=float(buy_max),
-            tp1=tp1, tp2=tp2, stop_loss=float(stop_loss),
-            horizon=mc_horizon, n_sim=4000, lookback=60,
-        )
-
-        # FIX: sizing konservatif dari entry terburuk (buy_max), bukan last_close
-        loss_per_share = buy_max - stop_loss
+        loss_per_share = last_close - stop_loss
         if loss_per_share <= 0:
             skipped_reason[ticker] = "loss_per_share ≤ 0"
             continue
@@ -1343,23 +1556,14 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         calc_lots      = int(rupiah_risk / loss_per_share / 100)
 
         max_alloc      = config['total_capital'] * (config['max_capital_allocation_pct'] / 100.0)
-        required_cap   = calc_lots * 100 * buy_max   # alokasi dari harga entry terburuk
+        required_cap   = calc_lots * 100 * last_close
         if required_cap > max_alloc:
-            calc_lots    = int(max_alloc / (100 * buy_max))
-            required_cap = calc_lots * 100 * buy_max
+            calc_lots    = int(max_alloc / (100 * last_close))
+            required_cap = calc_lots * 100 * last_close
 
         if calc_lots < 1:
             skipped_reason[ticker] = "modal tidak cukup untuk 1 lot"
             continue
-
-        # FIX: upside dari buy_max (entry terburuk) & risk range dari buy_min–buy_max
-        upside_tp1_pct = round((tp1 - buy_max) / buy_max * 100, 1)
-        upside_tp2_pct = round((tp2 - buy_max) / buy_max * 100, 1)
-        risk_min_pct   = round((buy_min - stop_loss) / buy_min * 100, 1)
-        risk_max_pct   = round((buy_max - stop_loss) / buy_max * 100, 1)
-        # R/R aktual dari entry terburuk
-        rr1_actual = round((tp1 - buy_max) / loss_per_share, 2)
-        rr2_actual = round((tp2 - buy_max) / loss_per_share, 2)
 
         clean_ticker = ticker.split('.')[0]
         results.append({
@@ -1371,28 +1575,23 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             "Buy Min":      buy_min,
             "Buy Max":      buy_max,
             "TP1":          int(tp1),
-            "Upside TP1":   f"+{upside_tp1_pct}%",
+            "Upside TP1":   f"+{round((tp1 - last_close) / last_close * 100, 1)}%",
             "TP2":          int(tp2),
-            "Upside TP2":   f"+{upside_tp2_pct}%",
+            "Upside TP2":   f"+{round((tp2 - last_close) / last_close * 100, 1)}%",
             "Stop Loss":    int(stop_loss),
-            "Risk%":        f"-{risk_min_pct}% / -{risk_max_pct}%",
-            "R/R TP1":      f"1:{rr1_actual}",
-            "R/R TP2":      f"1:{rr2_actual}",
+            "Risk%":        f"-{round((last_close - stop_loss) / last_close * 100, 1)}%",
+            "R/R TP1":      f"1:{plan['rr1']}",
+            "R/R TP2":      f"1:{plan['rr2']}",
             "ATR":          round(ind['atr_val'], 1),
             "RSI":          round(ind['rsi_val'], 1),
             "CMF":          round(ind['cmf_val'], 3),
             "TS Kriteria":  plan['ts_rule'],
             "Lots":         int(calc_lots),
             "Alokasi (Rp)": required_cap,
-            # OPTIMASI: flag zona stale (live berbeda > 1×ATR dari close)
-            "_zone_stale":  False,   # diisi setelah live price tersedia
-            "_atr_val":     ind['atr_val'],
-            "_last_close":  last_close,
             "_breakdown":   breakdown,
             "_vol_ctx":     vol_ctx,
             "_tape":        tape,
             "_bandar":      bandar,
-            "_mc":          mc,
         })
 
     # Simpan summary ke session state untuk debug view
@@ -1413,12 +1612,7 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         lp = live_prices.get(r["_ticker_jk"])
         r["Live Price"] = int(round(lp)) if lp else r["Last Price"]
         r["Live Src"]   = "live" if lp else "delayed"
-        # OPTIMASI: tandai zona stale jika live bergerak > 1×ATR dari harga close
-        if lp:
-            r["_zone_stale"] = abs(lp - r["_last_close"]) > r["_atr_val"]
         del r["_ticker_jk"]
-        del r["_atr_val"]
-        del r["_last_close"]
 
     return (
         pd.DataFrame(results)
@@ -1489,7 +1683,7 @@ def _render_tape_bandar_html(tape: dict, bandar: dict) -> str:
     tape_sigs = tape.get('signals', [])
     if tape_sigs:
         pills_html = ''.join(
-            _tape_pill(s['short'], s['style'], s['conf_pct']) for s in tape_sigs[:4]
+            _tape_pill(s[3], s[1], s[4]) for s in tape_sigs[:4]
         )
         parts.append(
             f'<div style="margin-bottom:0.25rem;">'
@@ -1512,35 +1706,8 @@ def _render_tape_bandar_html(tape: dict, bandar: dict) -> str:
         )
 
     # ── Narasi ────────────────────────────────────────────────────────────
-    # FIX: pilih narasi dari sinyal dominant terkuat (tape vs bandar)
-    tape_dom   = tape.get('dominant')
-    bandar_dom = bandar.get('dominant')
-    if tape_dom and bandar_dom:
-        use_bandar_narasi = bandar_dom['conf_pct'] >= tape_dom['conf_pct']
-    else:
-        use_bandar_narasi = bool(bandar_dom)
-
-    narasi_tech  = bandar.get('narasi_tech', '') if use_bandar_narasi else ''
-    narasi_plain = bandar.get('narasi_plain', '') if use_bandar_narasi else ''
-
-    # Jika tape dominant lebih kuat, bangun narasi dari tape
-    if not use_bandar_narasi and tape_dom:
-        tape_narasi_map = {
-            'buying_climax':  ("Volume ekstrem + candle bullish besar — potensi buying climax.",
-                               "Semua orang beli sekarang, tapi ini saat bandar mulai jual. Waspada balik arah."),
-            'selling_climax': ("Volume ekstrem + candle bearish besar — selling climax, potensi reversal naik.",
-                               "Semua orang panik jual. Ini biasanya momen bandar masuk beli murah."),
-            'absorption':     ("Volume besar namun harga tidak turun signifikan — demand menyerap supply.",
-                               "Ada yang beli besar dan menahan harga agar tidak jatuh. Tanda akumulasi aktif."),
-            'exhaustion':     ("Volume tinggi tapi range candle kecil — tenaga gerak mulai habis.",
-                               "Banyak yang trading tapi harga nggak kemana-mana. Momentum hampir habis."),
-            'accum_quiet':    ("5 candle volume rendah konsisten, harga tidak turun — akumulasi senyap.",
-                               "Tidak ada yang buang saham ini. Bandar sedang diam-diam mengumpulkan."),
-        }
-        narasi_tech, narasi_plain = tape_narasi_map.get(
-            tape_dom['key'], ("Sinyal tape terdeteksi.", "Pantau pergerakan lebih lanjut.")
-        )
-
+    narasi_tech  = bandar.get('narasi_tech', '')
+    narasi_plain = bandar.get('narasi_plain', '')
     if narasi_tech:
         parts.append(
             f'<div style="background:rgba(255,255,255,0.02);border-left:2px solid #30363d;'
@@ -1653,24 +1820,25 @@ def compute_best_buy_score(row: pd.Series) -> tuple[float, list[str]]:
     dom    = bandar.get("dominant")
     if dom:
         conf_pts = {"high": 15, "med": 8, "low": 3}.get(dom.get("conf", "low"), 3)
-        if dom.get("style") == "distrib":
-            # Distribusi: penalti, tidak tambah poin
-            total -= 5
-            reasons.append("⚠️ Sinyal distribusi bandar terdeteksi")
+        # Hanya akumulasi / markup yang bernilai positif; distribusi dikurangi
+        if dom.get("style") in ("distrib",):
+            conf_pts = -5
+            reasons.append(f"⚠️ Sinyal distribusi bandar terdeteksi")
         else:
             total += conf_pts
             reasons.append(f"🔍 Bandar: {dom.get('label','')} ({dom.get('conf','')})")
+        total += conf_pts if dom.get("style") not in ("distrib",) else 0
     else:
         reasons.append("— Tidak ada sinyal bandar")
 
-    # 5. Tape bullish confirmation — FIX: tape signals sekarang dict
+    # 5. Tape bullish confirmation
     tape      = row.get("_tape", {})
     tape_sigs = tape.get("signals", [])
-    accum_tape = [s for s in tape_sigs if s['style'] == 'accum']
+    accum_tape = [s for s in tape_sigs if s[1] in ("accum",)]
     if accum_tape:
         total += 10
-        reasons.append(f"📼 Tape: {accum_tape[0]['label']}")
-    elif any(s['style'] == 'distrib' for s in tape_sigs):
+        reasons.append(f"📼 Tape: {accum_tape[0][2]}")
+    elif any(s[1] == "distrib" for s in tape_sigs):
         total -= 5
         reasons.append("📼 Tape: sinyal distribusi")
 
@@ -1840,7 +2008,7 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
                 vol_ctx_html     = _render_volume_ctx_html(vol_ctx)
                 tape_bandar_html = _render_tape_bandar_html(tape, bandar)
 
-                # ── Signal validity check — harus sebelum mc_html & banner ──
+                # ── Signal validity check ──────────────────────────────────
                 validity = _check_signal_validity(
                     row["Live Price"], row["Stop Loss"],
                     row["Buy Min"],   row["Buy Max"]
@@ -1848,9 +2016,7 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
                 is_best  = (row["Ticker"] == best_ticker)
                 card_cls = validity['card_cls']
                 if is_best:
-                    card_cls = "best-buy-card"
-
-                mc_html = _render_mc_html(row.get("_mc", {}), is_expired=(validity['status'] == 'expired'))
+                    card_cls = "best-buy-card"   # override warna border
 
                 # Crown badge — hanya di kartu best buy
                 crown_html = (
@@ -1873,15 +2039,6 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
                     )
                 else:
                     banner_html = ''
-
-                # OPTIMASI: stale zone warning (live bergerak > 1×ATR dari close)
-                is_stale = row.get("_zone_stale", False)
-                stale_html = (
-                    '<div style="background:rgba(219,109,40,0.08);border:1px solid rgba(219,109,40,0.3);'
-                    'border-radius:6px;padding:0.3rem 0.6rem;margin-bottom:0.4rem;font-size:0.67rem;color:#db6d28;">'
-                    '⚡ Zona beli dihitung saat close — harga sudah bergerak >1×ATR. Verifikasi entry sebelum order.'
-                    '</div>'
-                ) if (is_stale and not is_expired) else ''
 
                 # Dimmed wrapper untuk level TP/SL/Lots saat expired
                 dim_open  = '<div class="dimmed">' if is_expired else '<div>'
@@ -1910,9 +2067,6 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
 
                     # Validity banner (tampil jika tidak valid)
                     f'{banner_html}'
-
-                    # Stale zone warning
-                    f'{stale_html}'
 
                     # Harga live + zona — selalu tampil tapi pesan sudah ada di banner
                     f'{_price_status_html(row["Live Price"], row["Last Price"], row["Buy Min"], row["Buy Max"], row["Live Src"])}'
@@ -1945,275 +2099,127 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
 
                     # Tape & bandar — selalu tampil (tetap berguna untuk context)
                     f'{tape_bandar_html}'
-
-                    # Monte Carlo probability block
-                    f'{mc_html}'
                     f'</div>'
                 )
                 st.markdown(html, unsafe_allow_html=True)
 
-# =============================================================================
-# 9b. RENDER SCREENING RESULT TABLE  (interaktif — klik ticker → detail card)
-# =============================================================================
-def _render_detail_card_html(row: pd.Series, best_ticker: str | None) -> str:
-    """
-    Render full detail card HTML untuk satu saham — sama persis dengan kartu utama
-    tapi tanpa render Streamlit column (langsung HTML string).
-    """
-    validity = _check_signal_validity(
-        row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"]
-    )
-    is_best    = (row["Ticker"] == best_ticker)
-    is_expired = validity['status'] == 'expired'
-    is_waiting = validity['status'] == 'waiting'
-    is_stale   = row.get("_zone_stale", False)
+                # ── Vision Agent trigger ───────────────────────────────────
+                ticker_key = row["Ticker"]
+                cache_key  = f"{ticker_key}_{datetime.now().strftime('%Y%m%d')}"
+                has_key    = bool(st.session_state.get('anthropic_key', ''))
 
-    card_cls   = "best-buy-card" if is_best else validity['card_cls']
+                if st.button(
+                    "🤖 Analisis AI" if has_key else "🔒 Analisis AI (butuh API key)",
+                    key=f"vision_btn_{ticker_key}",
+                    disabled=not has_key,
+                    use_container_width=True,
+                ):
+                    ticker_jk = ticker_key + ".JK"
+                    df_raw    = st.session_state['raw_market_data'].get(ticker_jk, pd.DataFrame())
+                    row_dict  = row.to_dict()
 
-    bd         = row.get("_breakdown", {})
-    vol_ctx    = row.get("_vol_ctx", {})
-    tape       = row.get("_tape", {})
-    bandar     = row.get("_bandar", {})
+                    with st.spinner(f"Generating chart & analisis AI untuk {ticker_key}..."):
+                        # Ambil trade plan dari data yang ada
+                        trade_plan_preview = {
+                            'stop_loss': row.get('Stop Loss'),
+                            'tp1': row.get('TP1'),
+                            'tp2': row.get('TP2'),
+                        }
+                        charts = generate_charts_for_ticker(ticker_jk, df_raw, trade_plan_preview)
 
-    def pill_from_bd(key, label):
-        if key not in bd: return ""
-        score_val, sig = bd[key]
-        return _pill(f"{label} {score_val:.0f}", sig)
+                        # Bangun indikator summary
+                        ind_data = {}
+                        try:
+                            ind_data = calculate_indicators(df_raw)
+                        except Exception:
+                            pass
+                        ind_summary = build_indicator_summary(ind_data, row)
 
-    pills_html       = (pill_from_bd("trend","EMA") + pill_from_bd("rsi","RSI")
-                        + pill_from_bd("cmf","CMF") + pill_from_bd("volume","VOL")
-                        + pill_from_bd("squeeze","SQZ"))
-    vol_ctx_html     = _render_volume_ctx_html(vol_ctx)
-    tape_bandar_html = _render_tape_bandar_html(tape, bandar)
-    mc_html          = _render_mc_html(row.get("_mc", {}), is_expired=is_expired)
+                        # Panggil Vision Agent
+                        vision_result = call_vision_agent(
+                            charts, ind_summary,
+                            st.session_state.get('anthropic_key', '')
+                        )
 
-    crown_html = ('<div><span class="best-buy-crown">👑 Best Buy</span></div>'
-                  if is_best else '')
+                        # Cache hasil
+                        st.session_state['vision_cache'][cache_key] = {
+                            'result': vision_result,
+                            'charts': charts,
+                        }
 
-    if is_expired or is_waiting:
-        banner_html = (
-            f'<div class="{validity["banner_cls"]}">'
-            f'  <div style="font-size:0.78rem;font-weight:800;color:{validity["title_color"]};margin-bottom:0.2rem;">'
-            f'    {validity["title"]}</div>'
-            f'  <div style="font-size:0.68rem;color:#c9d1d9;line-height:1.35;">{validity["detail"]}</div>'
-            f'  <div style="font-size:0.65rem;color:#8b949e;margin-top:0.2rem;font-style:italic;">{validity["action"]}</div>'
-            f'</div>'
-        )
-    else:
-        banner_html = ''
-
-    stale_html = (
-        '<div style="background:rgba(219,109,40,0.08);border:1px solid rgba(219,109,40,0.3);'
-        'border-radius:6px;padding:0.3rem 0.6rem;margin-bottom:0.4rem;font-size:0.67rem;color:#db6d28;">'
-        '⚡ Zona beli dihitung saat close — harga sudah bergerak >1×ATR. Verifikasi entry sebelum order.'
-        '</div>'
-    ) if (is_stale and not is_expired) else ''
-
-    dim_open  = '<div class="dimmed">' if is_expired else '<div>'
-
-    return (
-        f'<div class="metric-card {card_cls}" style="max-width:480px;margin:0 auto;">'
-        f'{crown_html}'
-        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.3rem;">'
-        f'  <span class="ticker">{row["Ticker"]}</span>'
-        f'  <div style="display:flex;gap:0.4rem;align-items:center;">'
-        f'    {_grade_badge(row["Grade"])}'
-        f'    <span class="score-badge">Score {row["Score"]}</span>'
-        f'  </div>'
-        f'</div>'
-        f'<div style="margin-bottom:0.5rem;">{pills_html}</div>'
-        f'{vol_ctx_html}'
-        f'{banner_html}'
-        f'{stale_html}'
-        f'{_price_status_html(row["Live Price"], row["Last Price"], row["Buy Min"], row["Buy Max"], row["Live Src"])}'
-        f'{dim_open}'
-        f'<div class="price-range">{int(row["Buy Min"])} – {int(row["Buy Max"])}</div>'
-        f'<div class="label" style="margin-bottom:0.6rem;">Area Rentang Buy · ATR {row["ATR"]}</div>'
-        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;'
-        f'margin-bottom:0.6rem;border-top:1px solid #30363d;padding-top:0.4rem;">'
-        f'  <div><div class="label">TP 1 <span class="rr-badge">({row["R/R TP1"]})</span></div>'
-        f'  <div class="tp">{int(row["TP1"])} <span style="font-size:0.68rem;opacity:0.8">{row["Upside TP1"]}</span></div></div>'
-        f'  <div><div class="label">TP 2 <span class="rr-badge">({row["R/R TP2"]})</span></div>'
-        f'  <div class="tp">{int(row["TP2"])} <span style="font-size:0.68rem;opacity:0.8">{row["Upside TP2"]}</span></div></div>'
-        f'</div>'
-        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;margin-bottom:0.6rem;">'
-        f'  <div><div class="label">Stop Loss</div>'
-        f'  <div class="sl">{int(row["Stop Loss"])} <span style="font-size:0.68rem;opacity:0.8">{row["Risk%"]}</span></div></div>'
-        f'  <div><div class="label">Trailing Strategy</div>'
-        f'  <div class="ts-rule" style="font-size:0.78rem;">{row["TS Kriteria"]}</div></div>'
-        f'</div>'
-        f'<div style="border-top:1px solid #30363d;padding-top:0.4rem;'
-        f'display:grid;grid-template-columns:1fr 1fr;gap:0.3rem;font-size:0.75rem;">'
-        f'  <div><div class="label">Lots Berbasis Risiko</div>'
-        f'  <div style="color:#fff;font-weight:600">{int(row["Lots"])} Lot</div></div>'
-        f'  <div><div class="label">Maks Alokasi</div>'
-        f'  <div style="color:#58a6ff;font-weight:600">{fmt_idr(row["Alokasi (Rp)"])}</div></div>'
-        f'</div>'
-        f'</div>'
-        f'{tape_bandar_html}'
-        f'{mc_html}'
-        f'</div>'
-    )
-
-
-def render_screening_table(df: pd.DataFrame, best_ticker: str | None = None):
-    """
-    Tabel ringkasan hasil skrining.
-    Setiap baris punya tombol ticker — klik untuk muncul detail card lengkap.
-    """
-    if df.empty:
-        return
-
-    st.markdown("---")
-    st.markdown("### 📊 Tabel Ringkasan Hasil Skrining")
-    st.caption("Klik ticker untuk melihat detail lengkap · Kolom Trading Plan disorot")
-
-    # ── Session state untuk selected ticker ───────────────────────────────
-    if 'selected_ticker_detail' not in st.session_state:
-        st.session_state['selected_ticker_detail'] = None
-
-    # ── Baris tombol ticker ────────────────────────────────────────────────
-    tickers_list = df["Ticker"].tolist()
-    n = len(tickers_list)
-    cols_per_row = min(n, 8)
-    ticker_rows = [tickers_list[i:i+cols_per_row] for i in range(0, n, cols_per_row)]
-
-    for t_row in ticker_rows:
-        cols = st.columns(len(t_row))
-        for col, t in zip(cols, t_row):
-            row_data = df[df["Ticker"] == t].iloc[0]
-            validity = _check_signal_validity(
-                row_data["Live Price"], row_data["Stop Loss"],
-                row_data["Buy Min"],   row_data["Buy Max"]
-            )
-            grade = row_data.get("Grade", "C")
-            grade_color = {"A": "🟢", "B": "🔵", "C": "🟠"}.get(grade, "⚪")
-            is_sel = (st.session_state['selected_ticker_detail'] == t)
-            status_icon = {"valid": "●", "waiting": "⏳", "expired": "⚠"}.get(validity['status'], "")
-            btn_label = f"{grade_color} {t}"
-            if col.button(btn_label, key=f"tbl_btn_{t}",
-                          type="primary" if is_sel else "secondary",
-                          use_container_width=True):
-                # Toggle: klik ulang untuk tutup
-                if st.session_state['selected_ticker_detail'] == t:
-                    st.session_state['selected_ticker_detail'] = None
-                else:
-                    st.session_state['selected_ticker_detail'] = t
-                st.rerun()
-
-    # ── Detail card untuk ticker yang dipilih ─────────────────────────────
-    sel = st.session_state.get('selected_ticker_detail')
-    if sel and sel in df["Ticker"].values:
-        sel_row = df[df["Ticker"] == sel].iloc[0]
-        with st.container():
-            st.markdown(f"#### 📋 Detail: {sel}")
-            card_html = _render_detail_card_html(sel_row, best_ticker)
-            # Render di kolom tengah agar tidak terlalu lebar
-            _, mid, _ = st.columns([1, 3, 1])
-            with mid:
-                st.markdown(card_html, unsafe_allow_html=True)
-
-    # ── Tabel HTML ─────────────────────────────────────────────────────────
-    rows_html = ""
-    for _, row in df.iterrows():
-        ticker = row["Ticker"]
-        validity = _check_signal_validity(
-            row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"]
-        )
-        status  = validity['status']
-        is_best = (ticker == best_ticker)
-        is_sel  = (ticker == st.session_state.get('selected_ticker_detail'))
-
-        if is_best:
-            row_cls = "best-buy-row"
-        elif status == "expired":
-            row_cls = "expired-row"
-        else:
-            row_cls = ""
-        # Highlight selected row
-        sel_style = "outline:2px solid #58a6ff;" if is_sel else ""
-
-        score = row["Score"]
-        if score >= 75:
-            score_cls = "tbl-score-hi"
-        elif score >= 60:
-            score_cls = "tbl-score-md"
-        else:
-            score_cls = "tbl-score-lo"
-
-        if status == "valid":
-            status_html = '<span class="tbl-status-valid">● Zona Beli</span>'
-        elif status == "waiting":
-            status_html = '<span class="tbl-status-waiting">⏳ Tunggu</span>'
-        else:
-            status_html = '<span class="tbl-status-expired">⚠ Expired</span>'
-
-        grade = row.get("Grade", "C")
-        grade_color = {"A": "#3fb950", "B": "#58a6ff", "C": "#db6d28"}.get(grade, "#8b949e")
-
-        is_stale   = row.get("_zone_stale", False)
-        crown      = '<span class="tbl-crown">👑 </span>' if is_best else ""
-        stale_flag = (' <span style="color:#db6d28;font-size:0.6rem;font-weight:700;"'
-                      ' title="Zona stale >1×ATR dari close">⚡</span>') if is_stale else ""
-
-        def fmt(v):
-            try:    return f"{int(v):,}".replace(",", ".")
-            except: return str(v)
-
-        rows_html += (
-            f'<tr class="{row_cls}" style="{sel_style}">'
-            f'  <td>{crown}<span class="tbl-ticker">{ticker}</span>{stale_flag}</td>'
-            f'  <td><span style="color:{grade_color};font-weight:800;">{grade}</span></td>'
-            f'  <td><span class="{score_cls}">{score}</span></td>'
-            f'  <td>{status_html}</td>'
-            f'  <td style="color:#c9d1d9;font-weight:600;">{fmt(row["Live Price"])}</td>'
-            f'  <td><span class="tbl-buy">{fmt(row["Buy Min"])} – {fmt(row["Buy Max"])}</span></td>'
-            f'  <td>'
-            f'    <span class="tbl-tp">{fmt(row["TP1"])}</span>'
-            f'    <span class="tbl-rr"> {row["R/R TP1"]}</span>'
-            f'    <div style="font-size:0.62rem;color:#3fb950;opacity:0.7;">{row["Upside TP1"]}</div>'
-            f'  </td>'
-            f'  <td>'
-            f'    <span class="tbl-tp">{fmt(row["TP2"])}</span>'
-            f'    <span class="tbl-rr"> {row["R/R TP2"]}</span>'
-            f'    <div style="font-size:0.62rem;color:#3fb950;opacity:0.7;">{row["Upside TP2"]}</div>'
-            f'  </td>'
-            f'  <td>'
-            f'    <span class="tbl-sl">{fmt(row["Stop Loss"])}</span>'
-            f'    <div style="font-size:0.62rem;color:#f85149;opacity:0.8;margin-top:1px;">{row["Risk%"]}</div>'
-            f'  </td>'
-            f'  <td style="color:#c9d1d9;">{row["ATR"]}</td>'
-            f'  <td style="color:#bc8cff;font-weight:600;">{int(row["Lots"])} Lot</td>'
-            f'  <td style="color:#58a6ff;font-size:0.72rem;">{fmt_idr(row["Alokasi (Rp)"])}</td>'
-            f'  <td style="color:#db6d28;font-size:0.68rem;max-width:140px;white-space:normal;'
-            f'text-align:left;">{row["TS Kriteria"]}</td>'
-            f'</tr>'
-        )
-
-    table_html = f"""
-    <div class="screening-table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Ticker</th><th>Grade</th><th>Score</th><th>Status</th>
-            <th>Harga Live</th>
-            <th class="buy-header">📍 Zona Beli</th>
-            <th class="tp-header">🎯 TP 1</th>
-            <th class="tp-header">🎯 TP 2</th>
-            <th class="sl-header">🛡 Stop Loss</th>
-            <th>ATR</th><th>Lots</th><th>Alokasi</th><th>Trailing Strategy</th>
-          </tr>
-        </thead>
-        <tbody>{rows_html}</tbody>
-      </table>
-    </div>
-    """
-    st.markdown(table_html, unsafe_allow_html=True)
-
+                # Tampilkan hasil Vision jika sudah ada di cache
+                if cache_key in st.session_state.get('vision_cache', {}):
+                    cached = st.session_state['vision_cache'][cache_key]
+                    render_vision_section(
+                        ticker_key,
+                        cached['result'],
+                        cached['charts'],
+                        st.session_state.get('tg_token', ''),
+                        st.session_state.get('tg_chatid', ''),
+                        st.session_state.get('sheets_url', ''),
+                        row,
+                    )
 
 # =============================================================================
 # 10. SIDEBAR
 # =============================================================================
+
+# ── Integrasi AI Vision + Notifikasi ──────────────────────────────────────
+st.sidebar.header("🤖 AI Vision & Notifikasi")
+with st.sidebar.expander("⚙️ Konfigurasi Integrasi", expanded=False):
+    st.caption("Credentials hanya tersimpan di sesi ini.")
+
+    anthropic_key = st.text_input("Anthropic API Key", type="password",
+                                   placeholder="sk-ant-...",
+                                   help="Dapatkan di console.anthropic.com")
+    st.markdown("**Telegram**")
+    tg_token  = st.text_input("Bot Token", type="password", placeholder="123456:ABC-...",
+                               help="Dari @BotFather di Telegram")
+    tg_chatid = st.text_input("Chat ID / Group ID", placeholder="-100xxxxxxxxx",
+                               help="Gunakan @userinfobot untuk cek ID grup")
+    st.markdown("**Google Sheets** (via Apps Script Webhook)")
+    sheets_url = st.text_input("Webhook URL", placeholder="https://script.google.com/macros/s/...",
+                                help="Buat Apps Script Web App, deploy as anyone. Panduan di sidebar bawah.")
+
+    if anthropic_key:
+        st.success("✅ Anthropic key aktif")
+    if tg_token and tg_chatid:
+        if st.button("🔔 Test Telegram"):
+            ok = send_telegram(tg_token, tg_chatid,
+                               "✅ <b>IDX Screener Ultra</b> — koneksi Telegram berhasil!")
+            st.success("Terkirim!") if ok else st.error("Gagal — cek token & chat ID.")
+
+    # Panduan singkat GSheets
+    with st.expander("📖 Cara Setup Google Sheets"):
+        st.markdown("""
+1. Buka [script.google.com](https://script.google.com)
+2. Buat project baru → paste kode di bawah
+3. Deploy → **Web App** → Execute as: **Me** → Who has access: **Anyone**
+4. Copy URL deployment → paste di atas
+
+```
+function doPost(e) {
+  var sheet = SpreadsheetApp.openByUrl('URL_SPREADSHEET_KAMU').getActiveSheet();
+  var data = JSON.parse(e.postData.contents);
+  sheet.appendRow([
+    data.timestamp, data.ticker, data.score, data.grade,
+    data.live_price, data.buy_min, data.buy_max,
+    data.tp1, data.tp2, data.stop_loss, data.rr_tp1,
+    data.lots, data.alokasi, data.keputusan,
+    data.confidence, data.alasan, data.trend, data.momentum
+  ]);
+  return ContentService.createTextOutput('OK');
+}
+```
+        """)
+
+# Persist credentials ke session state
+st.session_state['anthropic_key'] = anthropic_key
+st.session_state['tg_token']      = tg_token
+st.session_state['tg_chatid']     = tg_chatid
+st.session_state['sheets_url']    = sheets_url
+
+st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Parameter Algoritma")
 capital         = st.sidebar.number_input("Total Modal Akun (Rp)", value=50_000_000, step=5_000_000, min_value=1_000_000)
 risk_limit      = st.sidebar.slider("Maks Risiko per Trade (%)", 0.5, 5.0, 2.0, 0.5)
@@ -2350,55 +2356,93 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
 
     render_trade_cards(final_df, max_cards=6, best_ticker=best_ticker)
 
-    # ── Tabel Ringkasan Hasil Skrining ────────────────────────────────────
-    render_screening_table(final_df, best_ticker=best_ticker)
+    # ── Tabel Ringkas untuk Orang Awam ────────────────────────────────────
+    if not final_df.empty:
+        st.markdown("---")
+        st.markdown("### 📋 Ringkasan Semua Hasil Skrining")
+        st.caption("Semua saham yang lolos filter, diurutkan dari yang paling direkomendasikan.")
 
-    # ── Debug panel — diisi setelah engine selesai ────────────────────────
+        # Bangun tabel yang bersih dan mudah dibaca
+        def _validity_label(row):
+            v = _check_signal_validity(row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"])
+            return {"valid": "✅ Siap Entry", "waiting": "⏳ Tunggu Dulu", "expired": "🚫 Hindari"}[v["status"]]
+
+        def _bandar_label(row):
+            dom = row.get("_bandar", {}).get("dominant")
+            if not dom:
+                return "—"
+            conf_map = {"high": "🔴", "med": "🟡", "low": "⚪"}
+            return f"{conf_map.get(dom['conf'], '')} {dom['label']}"
+
+        def _tape_label(row):
+            sigs = row.get("_tape", {}).get("signals", [])
+            if not sigs:
+                return "—"
+            return sigs[0][2]  # nama sinyal terkuat
+
+        tabel_rows = []
+        for _, row in final_df.iterrows():
+            is_best = row["Ticker"] == best_ticker
+            tabel_rows.append({
+                "🏆":          "👑" if is_best else "",
+                "Saham":       row["Ticker"],
+                "Harga Skrg":  f"Rp {int(row['Live Price']):,}".replace(",", "."),
+                "Zona Beli":   f"Rp {int(row['Buy Min']):,} – {int(row['Buy Max']):,}".replace(",", "."),
+                "Target 1":    f"Rp {int(row['TP1']):,} ({row['Upside TP1']})".replace(",", "."),
+                "Target 2":    f"Rp {int(row['TP2']):,} ({row['Upside TP2']})".replace(",", "."),
+                "Stop Loss":   f"Rp {int(row['Stop Loss']):,} ({row['Risk%']})".replace(",", "."),
+                "R/R":         row["R/R TP1"],
+                "Score":       row["Score"],
+                "Grade":       row["Grade"],
+                "Status":      _validity_label(row),
+                "Sinyal Bandar": _bandar_label(row),
+                "Tape":        _tape_label(row),
+                "Lot Saran":   f"{int(row['Lots'])} lot",
+                "Alokasi":     fmt_idr(row["Alokasi (Rp)"]),
+            })
+
+        tabel_df = pd.DataFrame(tabel_rows)
+
+        # Style — warna baris berdasarkan status
+        def _style_row(row):
+            status = row["Status"]
+            if "Siap" in status:
+                bg = "background-color: rgba(63,185,80,0.07)"
+            elif "Tunggu" in status:
+                bg = "background-color: rgba(227,179,65,0.07)"
+            elif "Hindari" in status:
+                bg = "background-color: rgba(248,81,73,0.07)"
+            else:
+                bg = ""
+            return [bg] * len(row)
+
+        styled = (
+            tabel_df.style
+            .apply(_style_row, axis=1)
+            .set_properties(**{
+                "font-size": "0.82rem",
+                "text-align": "left",
+            })
+            .set_table_styles([{
+                "selector": "th",
+                "props": [("font-size", "0.75rem"), ("text-transform", "uppercase"),
+                          ("letter-spacing", "0.4px"), ("color", "#8b949e")]
+            }])
+        )
+
+        st.dataframe(styled, use_container_width=True, hide_index=True,
+                     height=min(80 + len(tabel_rows) * 38, 600))
     meta = st.session_state.get('scan_meta', {})
     with debug_placeholder.expander("🔬 Debug / Audit Scan", expanded=False):
+        st.write(f"**Input:** {meta.get('total_input', 0)} saham")
+        st.write(f"**Lolos:** {meta.get('lolos', 0)} saham")
+        st.write(f"**Difilter:** {meta.get('difilter', 0)} saham")
         skipped = meta.get('skipped', {})
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Input", meta.get('total_input', 0))
-        col2.metric("Lolos", meta.get('lolos', 0))
-        col3.metric("Difilter", meta.get('difilter', 0))
-
         if skipped:
-            # Kategorisasi alasan skip
-            cats = {
-                "🚫 Zombie/Penny":  [],
-                "💤 Tidur/Illikuid": [],
-                "⛔ Suspend/Freeze": [],
-                "⚡ FCA/UMA":        [],
-                "📉 Score rendah":   [],
-                "🔧 Teknikal/Data":  [],
-                "💰 Harga/ADTV":     [],
-            }
-            for t, reason in skipped.items():
-                r = reason.lower()
-                if "zombie" in r:
-                    cats["🚫 Zombie/Penny"].append((t, reason))
-                elif "tidur" in r or "volume mati" in r or "median volume" in r:
-                    cats["💤 Tidur/Illikuid"].append((t, reason))
-                elif "suspended" in r or "freeze" in r or "stagnant" in r or "spread" in r:
-                    cats["⛔ Suspend/Freeze"].append((t, reason))
-                elif "fca" in r or "uma" in r:
-                    cats["⚡ FCA/UMA"].append((t, reason))
-                elif "score" in r:
-                    cats["📉 Score rendah"].append((t, reason))
-                elif "harga" in r or "adtv" in r or "filter" in r:
-                    cats["💰 Harga/ADTV"].append((t, reason))
-                else:
-                    cats["🔧 Teknikal/Data"].append((t, reason))
-
-            for cat_label, items in cats.items():
-                if items:
-                    st.markdown(f"**{cat_label}** ({len(items)} saham)")
-                    st.dataframe(
-                        pd.DataFrame(items, columns=["Ticker", "Alasan"]),
-                        use_container_width=True,
-                        hide_index=True,
-                        height=min(150, 38 + len(items) * 35),
-                    )
+            st.dataframe(
+                pd.DataFrame(list(skipped.items()), columns=["Ticker", "Alasan"]),
+                use_container_width=True, height=200
+            )
         else:
             st.caption("Semua saham lolos filter atau tidak ada yang difilter.")
 
@@ -2411,17 +2455,17 @@ if not st.session_state.get('raw_market_data'):
         st.caption("Jalankan skrining dulu.")
 elif 'scan_meta' in st.session_state and st.session_state['scan_meta']:
     meta = st.session_state['scan_meta']
+    # Hanya render kalau placeholder belum diisi (tidak ada cara cek langsung,
+    # tapi safe karena Streamlit idempotent — render ulang tidak masalah)
     with debug_placeholder.expander("🔬 Debug / Audit Scan", expanded=False):
+        st.write(f"**Input:** {meta.get('total_input', 0)} saham")
+        st.write(f"**Lolos:** {meta.get('lolos', 0)} saham")
+        st.write(f"**Difilter:** {meta.get('difilter', 0)} saham")
         skipped = meta.get('skipped', {})
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Input", meta.get('total_input', 0))
-        col2.metric("Lolos", meta.get('lolos', 0))
-        col3.metric("Difilter", meta.get('difilter', 0))
         if skipped:
             st.dataframe(
                 pd.DataFrame(list(skipped.items()), columns=["Ticker", "Alasan"]),
-                use_container_width=True, height=200,
-                hide_index=True,
+                use_container_width=True, height=200
             )
         else:
             st.caption("Semua saham lolos filter.")
