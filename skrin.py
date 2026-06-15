@@ -219,9 +219,14 @@ def calculate_bb_squeeze(df: pd.DataFrame,
     Lazybear-style BB Squeeze:
     True  = BB berada DI DALAM Keltner Channel → kompresi (energi menumpuk).
     False = BB sudah keluar KC → squeeze release / breakout sedang terjadi.
+
+    Fallback: jika data < bb_window, kembalikan Series False (tidak dalam squeeze).
     """
+    if len(df) < bb_window:
+        return pd.Series(False, index=df.index)
+
     basis   = df['Close'].rolling(bb_window).mean()
-    bb_std_ = df['Close'].rolling(bb_window).std(ddof=1)  # FIX #4: explicit ddof=1 (sample std)
+    bb_std_ = df['Close'].rolling(bb_window).std(ddof=1)
     bb_upper = basis + bb_std * bb_std_
     bb_lower = basis - bb_std * bb_std_
 
@@ -229,9 +234,64 @@ def calculate_bb_squeeze(df: pd.DataFrame,
     kc_upper = basis + kc_mult * atr
     kc_lower = basis - kc_mult * atr
 
-    return (bb_upper < kc_upper) & (bb_lower > kc_lower)
+    squeeze = (bb_upper < kc_upper) & (bb_lower > kc_lower)
+    return squeeze.fillna(False)
 
-def calculate_indicators(df: pd.DataFrame) -> dict:
+def calculate_adx(df: pd.DataFrame, window: int = 14) -> dict:
+    """
+    Average Directional Index (ADX) — kekuatan tren, bukan arahnya.
+    Kembalikan dict: {'adx': float, 'di_plus': float, 'di_minus': float}
+
+    ADX > 25 = tren kuat (bull atau bear)
+    ADX > 20 = tren mulai terbentuk
+    ADX < 20 = sideways / konsolidasi
+
+    Digunakan sebagai filter: squeeze release lebih valid jika ADX mulai naik.
+    """
+    if len(df) < window + 2:
+        return {'adx': 0.0, 'di_plus': 0.0, 'di_minus': 0.0}
+
+    high  = df['High'].values.astype(float)
+    low   = df['Low'].values.astype(float)
+    close = df['Close'].values.astype(float)
+
+    # True Range
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    tr = np.maximum(high - low,
+         np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+
+    # Directional Movement
+    up_move   = high - np.roll(high, 1)
+    down_move = np.roll(low, 1) - low
+    up_move[0]   = 0.0
+    down_move[0] = 0.0
+
+    dm_plus  = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    dm_minus = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    # Wilder smoothing (sama dengan ATR)
+    alpha = 1.0 / window
+    atr_w    = pd.Series(tr).ewm(alpha=alpha, adjust=False).mean().values
+    dmp_w    = pd.Series(dm_plus).ewm(alpha=alpha, adjust=False).mean().values
+    dmm_w    = pd.Series(dm_minus).ewm(alpha=alpha, adjust=False).mean().values
+
+    safe_atr = np.where(atr_w > 0, atr_w, 1e-9)
+    di_plus  = 100.0 * dmp_w / safe_atr
+    di_minus = 100.0 * dmm_w / safe_atr
+
+    di_sum  = di_plus + di_minus
+    dx      = np.where(di_sum > 0, 100.0 * np.abs(di_plus - di_minus) / di_sum, 0.0)
+    adx_s   = pd.Series(dx).ewm(alpha=alpha, adjust=False).mean().values
+
+    return {
+        'adx':      round(float(adx_s[-1]), 1),
+        'di_plus':  round(float(di_plus[-1]), 1),
+        'di_minus': round(float(di_minus[-1]), 1),
+    }
+
+
+
     """
     Hitung semua indikator sekaligus dan kembalikan sebagai dict scalar.
     Kalkulasi dilakukan sekali, bukan berulang di setiap fungsi scoring.
@@ -274,6 +334,11 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
     in_squeeze  = bool(sq_series.iloc[-1])
     squeeze_release = (not in_squeeze) and bool(sq_series.iloc[-2]) if len(sq_series) > 1 else False
 
+    # ADX — kekuatan tren (tidak mempengaruhi arah, hanya intensitas)
+    adx_data    = calculate_adx(df)
+    adx_val     = adx_data['adx']
+    adx_rising  = adx_val > 20  # tren sedang terbentuk
+
     # Volume spike vs MA-15
     vol_ma15    = float(volume.rolling(15).mean().iloc[-1])
     vol_last    = float(volume.iloc[-1])
@@ -301,6 +366,8 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
         'rsi_rising':      rsi_rising,
         'in_squeeze':      in_squeeze,
         'squeeze_release': squeeze_release,
+        'adx_val':         adx_val,
+        'adx_rising':      adx_rising,
         'vol_spike':       vol_spike,
         'adtv':            adtv,
     }
@@ -720,9 +787,21 @@ def score_volume(ind: dict) -> tuple[float, str]:
         return 0.0, "neut"
 
 def score_squeeze(ind: dict) -> tuple[float, str]:
-    """E. Bollinger Band Squeeze."""
+    """
+    E. Bollinger Band Squeeze + ADX confirmation.
+
+    Squeeze release LEBIH VALID jika ADX > 20 (tren sedang terbentuk).
+    Squeeze tanpa ADX = kompresi saja, belum tentu akan breakout.
+
+    Skor:
+    - Squeeze release + ADX rising (tren valid)  → 15
+    - Squeeze release saja (ADX lemah)            → 10
+    - Dalam squeeze (energi menumpuk)             → 8
+    - Tidak squeeze, tidak release               → 3
+    """
+    adx_ok = ind.get('adx_rising', False)
     if ind['squeeze_release']:
-        return 15.0, "bull"
+        return (15.0, "bull") if adx_ok else (10.0, "bull")
     elif ind['in_squeeze']:
         return 8.0, "neut"
     else:
@@ -753,6 +832,8 @@ def compute_total_score(ind: dict) -> tuple[float, dict]:
         'cmf':     (round(cm_score, 1), cm_sig),
         'volume':  (round(vo_score, 1), vo_sig),
         'squeeze': (round(sq_score, 1), sq_sig),
+        # ADX disimpan di breakdown untuk info display (bukan scoring terpisah)
+        'adx':     (round(ind.get('adx_val', 0.0), 1), 'bull' if ind.get('adx_rising') else 'neut'),
     }
     return round(total, 1), breakdown
 
@@ -779,14 +860,48 @@ SWING_PARAMS = {
     'fixed_risk_pct': 5.0,
 }
 
+def snap_to_tick(price: float, direction: str = "floor") -> int:
+    """
+    Snap harga ke fraksi harga IDX yang valid.
+
+    Fraksi harga IDX (BEI):
+    < 200        → Rp 1
+    200 – 500    → Rp 2   (kelipatan genap)
+    500 – 2000   → Rp 5
+    2000 – 5000  → Rp 10
+    5000 – 10000 → Rp 25
+    ≥ 10000      → Rp 50
+
+    direction: "floor" untuk SL/buy_min, "ceil" untuk TP/buy_max.
+    """
+    p = float(price)
+    if p < 200:
+        tick = 1
+    elif p < 500:
+        tick = 2
+    elif p < 2000:
+        tick = 5
+    elif p < 5000:
+        tick = 10
+    elif p < 10000:
+        tick = 25
+    else:
+        tick = 50
+
+    if direction == "ceil":
+        return int(np.ceil(p / tick) * tick)
+    else:
+        return int(np.floor(p / tick) * tick)
+
+
 def build_trade_plan(last_close: float, atr_val: float, mode_params: dict) -> dict:
     """
     Hitung level TP/SL dengan:
     1. SL berbasis ATR (volatilitas aktual)
     2. TP dijamin memenuhi minimum R/R ratio
     3. TP3 sebagai extended target (runner position)
-    4. Fallback ke persen flat jika ATR tidak valid
-    5. Guard: SL tidak negatif, semua level konsisten
+    4. Semua level di-snap ke fraksi harga IDX yang valid
+    5. Guard: SL tidak negatif, R/R minimum 1.5
 
     Partial Exit Plan (standar):
     - TP1 → exit 40% posisi, geser SL ke BEP
@@ -794,44 +909,48 @@ def build_trade_plan(last_close: float, atr_val: float, mode_params: dict) -> di
     - TP3 → exit sisa (20%) atau trailing stop
     """
     sl_dist = atr_val * mode_params['atr_sl_mult']
-    # SL minimum: setengah dari fixed_risk_pct agar tidak terlalu ketat
     min_sl_dist = last_close * (mode_params['fixed_risk_pct'] / 100.0) * 0.5
     sl_dist = max(sl_dist, min_sl_dist)
 
-    # Guard: SL tidak boleh menghasilkan harga negatif
     stop_loss_raw = last_close - sl_dist
     if stop_loss_raw <= 0:
-        sl_dist       = last_close * 0.95    # fallback: SL 5% di bawah harga
+        sl_dist       = last_close * 0.95
         stop_loss_raw = last_close - sl_dist
 
-    # Guard: R/R minimum 1.5 untuk TP1 (absolut)
     tp1_dist = max(sl_dist * mode_params['min_rr1'], sl_dist * 1.5)
     tp2_dist = sl_dist * mode_params['min_rr2']
     tp3_dist = sl_dist * mode_params['min_rr3']
 
-    tp1 = last_close + tp1_dist
-    tp2 = last_close + tp2_dist
-    tp3 = last_close + tp3_dist
+    # Snap ke fraksi IDX yang valid
+    stop_loss = snap_to_tick(stop_loss_raw, "floor")
+    tp1       = snap_to_tick(last_close + tp1_dist, "ceil")
+    tp2       = snap_to_tick(last_close + tp2_dist, "ceil")
+    tp3       = snap_to_tick(last_close + tp3_dist, "ceil")
 
-    rr1_actual = round(tp1_dist / sl_dist, 2)
-    rr2_actual = round(tp2_dist / sl_dist, 2)
-    rr3_actual = round(tp3_dist / sl_dist, 2)
+    # Hitung ulang sl_dist berdasarkan harga yang sudah di-snap
+    sl_dist_actual = last_close - stop_loss
+    if sl_dist_actual <= 0:
+        sl_dist_actual = sl_dist
 
-    # Partial exit allocation
+    rr1_actual = round((tp1 - last_close) / sl_dist_actual, 2)
+    rr2_actual = round((tp2 - last_close) / sl_dist_actual, 2)
+    rr3_actual = round((tp3 - last_close) / sl_dist_actual, 2)
+
     partial_plan = "TP1: exit 40% → geser SL ke BEP | TP2: exit 40% | TP3/Trail: sisa 20%"
 
     return {
-        'stop_loss':    float(np.floor(stop_loss_raw)),
-        'tp1':          float(np.ceil(tp1)),
-        'tp2':          float(np.ceil(tp2)),
-        'tp3':          float(np.ceil(tp3)),
-        'sl_dist':      sl_dist,
+        'stop_loss':    float(stop_loss),
+        'tp1':          float(tp1),
+        'tp2':          float(tp2),
+        'tp3':          float(tp3),
+        'sl_dist':      sl_dist_actual,
         'rr1':          rr1_actual,
         'rr2':          rr2_actual,
         'rr3':          rr3_actual,
         'ts_rule':      mode_params['ts_rule'],
         'partial_plan': partial_plan,
     }
+
 
 # =============================================================================
 # 7. DOWNLOAD ENGINE
@@ -998,17 +1117,17 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         tp2       = plan['tp2']
         tp3       = plan['tp3']
 
-        buy_min = int(np.floor(last_close - 0.5 * ind['atr_val']))
-        buy_max = int(np.ceil(last_close + 0.3 * ind['atr_val']))
+        # Zona beli: buy_max MAKSIMUM di last_close (tidak logis entry di atas harga close)
+        # buy_min = close - 0.5 ATR (support bawah zona), buy_max = close (batas atas)
+        buy_min = snap_to_tick(last_close - 0.5 * ind['atr_val'], "ceil")
+        buy_max = snap_to_tick(last_close, "floor")
 
-        # Guard: buy_min tidak boleh < stop_loss (entry di bawah SL tidak logis)
-        buy_min = max(buy_min, int(stop_loss) + 1)
-        # Guard: buy_max harus >= buy_min (mencegah zona terbalik)
-        buy_max = max(buy_max, buy_min + 1)
-        # Guard: buy_max tidak boleh >= TP1 (entry harus di bawah target)
-        if buy_max >= tp1:
-            buy_max = int(tp1) - 1
-            buy_min = min(buy_min, buy_max - 1)
+        # Guard bertingkat
+        buy_min = max(buy_min, snap_to_tick(stop_loss + 1, "ceil"))  # tidak boleh <= SL
+        buy_max = max(buy_max, buy_min)                               # tidak boleh terbalik
+        if buy_max >= tp1:                                            # tidak boleh >= TP1
+            buy_max = snap_to_tick(tp1 - 1, "floor")
+            buy_min = min(buy_min, buy_max)
 
         loss_per_share = last_close - stop_loss
         if loss_per_share <= 0:
@@ -1077,13 +1196,32 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
 
     for r in results:
         lp = live_prices.get(r["_ticker_jk"])
-        r["Live Price"] = int(round(lp)) if lp else r["Last Price"]
-        r["Live Src"]   = "live" if lp else "delayed"
+        # Guard: pastikan live price valid (tidak None, tidak NaN, tidak negatif)
+        if lp and np.isfinite(float(lp)) and float(lp) > 0:
+            r["Live Price"] = int(round(float(lp)))
+            r["Live Src"]   = "live"
+        else:
+            r["Live Price"] = int(r["Last Price"])  # fallback ke harga terakhir data
+            r["Live Src"]   = "delayed"
         del r["_ticker_jk"]
 
+    df_out = pd.DataFrame(results)
+
+    # FIX: Sort utama berdasarkan validity status, baru score
+    # expired card tidak boleh tampil di atas valid card meski score-nya tinggi
+    def _validity_rank(row) -> int:
+        lp = row.get("Live Price", row.get("Last Price", 0))
+        sl = row.get("Stop Loss", 0)
+        bmin = row.get("Buy Min", 0)
+        if lp <= sl:          return 2   # expired → paling bawah
+        elif lp < bmin:       return 1   # waiting → tengah
+        else:                 return 0   # valid   → paling atas
+
+    df_out["_validity_rank"] = df_out.apply(_validity_rank, axis=1)
     return (
-        pd.DataFrame(results)
-        .sort_values(by="Score", ascending=False)
+        df_out
+        .sort_values(by=["_validity_rank", "Score"], ascending=[True, False])
+        .drop(columns=["_validity_rank"])
         .reset_index(drop=True)
     )
 
@@ -1406,27 +1544,41 @@ def _check_signal_validity(live_price: int, stop_loss: int, buy_min: int, buy_ma
     Tentukan status validitas sinyal berdasarkan harga live vs level kunci.
 
     Status:
-    - 'valid'    : harga di dalam atau di atas zona beli, di atas SL → normal
-    - 'waiting'  : harga di bawah zona beli tapi MASIH di atas SL → belum saatnya entry
-    - 'expired'  : harga sudah di bawah SL → sinyal tidak valid, breakdown
+    - 'valid'   : harga di dalam atau di atas zona beli, di atas SL → normal
+    - 'waiting' : harga di bawah zona beli tapi masih di atas SL → belum saatnya entry
+    - 'expired' : harga menembus SL dengan margin > 1.5% → sinyal tidak valid
+
+    Buffer 1.5% diterapkan pada expired check untuk mengakomodasi noise
+    antara data live (yfinance fast_info) vs data historical yang dipakai
+    saat kalkulasi SL. Harga live bisa sedikit berbeda karena bid/ask spread
+    atau slight delay, sehingga tidak langsung dinyatakan expired.
     """
-    if live_price <= stop_loss:
+    SL_BUFFER_PCT = 0.015  # 1.5% buffer sebelum dinyatakan expired
+
+    expired_threshold = stop_loss * (1 - SL_BUFFER_PCT)
+
+    if live_price <= expired_threshold:
         gap_pct = round((stop_loss - live_price) / stop_loss * 100, 1)
+        sl_fmt   = f"{stop_loss:,}".replace(",", ".")
+        lp_fmt   = f"{live_price:,}".replace(",", ".")
         return {
             'status':   'expired',
             'title':    '⚠️ Sinyal Tidak Valid — Harga Breakdown',
-            'detail':   f'Harga ({live_price:,}) sudah {gap_pct}% di bawah SL ({stop_loss:,}). Jangan entry — sinyal dihitung saat kondisi berbeda.'.replace(',', '.'),
+            'detail':   f'Harga ({lp_fmt}) sudah {gap_pct}% di bawah SL ({sl_fmt}). Jangan entry — sinyal dihitung saat kondisi berbeda.',
             'action':   'Tunggu konfirmasi reversal atau skip saham ini.',
             'card_cls': 'signal-expired',
             'banner_cls': 'expired-banner',
             'title_color': '#f85149',
         }
     elif live_price < buy_min:
-        gap_pct = round((buy_min - live_price) / buy_min * 100, 1)
+        gap_pct  = round((buy_min - live_price) / buy_min * 100, 1)
+        bmin_fmt = f"{buy_min:,}".replace(",", ".")
+        bmax_fmt = f"{buy_max:,}".replace(",", ".")
+        lp_fmt   = f"{live_price:,}".replace(",", ".")
         return {
             'status':   'waiting',
             'title':    '⏳ Harga di Bawah Zona Beli',
-            'detail':   f'Harga ({live_price:,}) masih {gap_pct}% di bawah zona ({buy_min:,}–{buy_max:,}). SL masih aman — pantau, jangan entry dulu.'.replace(',', '.'),
+            'detail':   f'Harga ({lp_fmt}) masih {gap_pct}% di bawah zona ({bmin_fmt}–{bmax_fmt}). SL masih aman — pantau, jangan entry dulu.',
             'action':   'Entry hanya jika harga masuk zona beli.',
             'card_cls': 'signal-waiting',
             'banner_cls': 'waiting-banner',
@@ -1477,6 +1629,7 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
                     + pill_from_bd("cmf",   "CMF")
                     + pill_from_bd("volume","VOL")
                     + pill_from_bd("squeeze","SQZ")
+                    + pill_from_bd("adx",   "ADX")
                 )
 
                 vol_ctx_html     = _render_volume_ctx_html(vol_ctx)
@@ -1741,7 +1894,10 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
             sigs = row.get("_tape", {}).get("signals", [])
             if not sigs:
                 return "—"
-            return sigs[0][2]  # nama sinyal terkuat
+            s = sigs[0]
+            # tape signal adalah tuple: (key, style, label, short, conf_pct)
+            # index [2] = label — akses dengan guard panjang
+            return s[2] if isinstance(s, (tuple, list)) and len(s) > 2 else str(s)
 
         tabel_rows = []
         for _, row in final_df.iterrows():
