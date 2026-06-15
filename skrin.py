@@ -1150,6 +1150,23 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             skipped_reason[ticker] = "modal tidak cukup untuk 1 lot"
             continue
 
+        probs = estimate_trade_probabilities(
+            score=total_score,
+            grade=grade,
+            live_price=entry_ref,
+            buy_min=buy_min,
+            buy_max=buy_max,
+            stop_loss=stop_loss,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            atr_val=ind['atr_val'],
+            ind=ind,
+            vol_ctx=vol_ctx,
+            tape=tape,
+            bandar=bandar,
+        )
+
         clean_ticker = ticker.split('.')[0]
         results.append({
             "Ticker":       clean_ticker,
@@ -1170,6 +1187,12 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             "R/R TP1":      f"1:{plan['rr1']}",
             "R/R TP2":      f"1:{plan['rr2']}",
             "R/R TP3":      f"1:{plan['rr3']}",
+            "Prob Entry":   probs["Prob Entry"],
+            "Prob TP1":     probs["Prob TP1"],
+            "Prob TP2":     probs["Prob TP2"],
+            "Prob TP3":     probs["Prob TP3"],
+            "Prob SL":      probs["Prob SL"],
+            "Confidence":   probs["Confidence"],
             "ATR":          round(ind['atr_val'], 1),
             "RSI":          round(ind['rsi_val'], 1),
             "CMF":          round(ind['cmf_val'], 3),
@@ -1470,6 +1493,152 @@ def compute_best_buy_score(row: pd.Series) -> tuple[float, list[str]]:
     return round(max(total, 0.0), 1), reasons
 
 
+def clamp_prob(x: float, lo: float = 5.0, hi: float = 95.0) -> float:
+    """Batasi probabilitas agar tetap realistis dan mudah dibaca."""
+    try:
+        return round(max(lo, min(hi, float(x))), 1)
+    except Exception:
+        return lo
+
+
+def probability_label(prob: float) -> str:
+    if prob >= 75:
+        return "Tinggi"
+    if prob >= 60:
+        return "Sedang"
+    if prob >= 45:
+        return "Spekulatif"
+    return "Rendah"
+
+
+def estimate_trade_probabilities(
+    score: float,
+    grade: str,
+    live_price: float,
+    buy_min: float,
+    buy_max: float,
+    stop_loss: float,
+    tp1: float,
+    tp2: float,
+    tp3: float,
+    atr_val: float,
+    ind: dict,
+    vol_ctx: dict,
+    tape: dict,
+    bandar: dict,
+) -> dict:
+    """
+    Estimasi probabilitas rule-based untuk membandingkan kualitas setup.
+    Angka ini bukan kepastian prediktif; gunakan sebagai confidence relatif.
+    """
+    base = float(score) * 0.65
+    grade_bonus = {"A": 8.0, "B": 4.0, "C": 0.0}.get(grade, 0.0)
+
+    if stop_loss and live_price <= stop_loss:
+        status_adj = -35.0
+    elif buy_min <= live_price <= buy_max:
+        status_adj = 12.0
+    elif live_price < buy_min:
+        status_adj = -4.0
+    else:
+        over_zone = (live_price - buy_max) / max(buy_max, 1.0)
+        status_adj = -8.0 - min(over_zone * 80.0, 18.0)
+
+    trend_adj = 0.0
+    if ind.get("above_ema20"):
+        trend_adj += 3.0
+    if ind.get("above_ema50"):
+        trend_adj += 4.0
+    if ind.get("above_ema200"):
+        trend_adj += 3.0
+    if ind.get("ema20_rising"):
+        trend_adj += 3.0
+
+    momentum_adj = 0.0
+    rsi = ind.get("rsi_val", 50.0)
+    if 45 <= rsi <= 65:
+        momentum_adj += 5.0
+    elif 65 < rsi <= 75:
+        momentum_adj -= 2.0
+    elif rsi > 75:
+        momentum_adj -= 8.0
+    elif rsi < 35:
+        momentum_adj -= 5.0
+
+    cmf = ind.get("cmf_val", 0.0)
+    if cmf > 0.05:
+        momentum_adj += 4.0
+    elif cmf < -0.05:
+        momentum_adj -= 5.0
+
+    volume_adj = 0.0
+    if vol_ctx.get("valid"):
+        vol_ratio = vol_ctx.get("vol_ratio", 0.0)
+        candle_dir = vol_ctx.get("candle_dir")
+        if candle_dir == "bullish" and vol_ratio >= 1.3:
+            volume_adj += 6.0
+        elif vol_ratio >= 1.5:
+            volume_adj += 3.0
+        elif candle_dir == "bearish" and vol_ratio >= 1.3:
+            volume_adj -= 6.0
+
+    tape_adj = 0.0
+    for sig in tape.get("signals", []):
+        if isinstance(sig, (tuple, list)) and len(sig) >= 2:
+            if sig[1] == "accum":
+                tape_adj += 5.0
+            elif sig[1] == "distrib":
+                tape_adj -= 6.0
+            elif sig[1] == "warn":
+                tape_adj -= 3.0
+
+    bandar_adj = 0.0
+    dom = bandar.get("dominant")
+    if dom:
+        conf_weight = {"high": 7.0, "med": 4.0, "low": 2.0}.get(dom.get("conf"), 2.0)
+        if dom.get("style") == "accum":
+            bandar_adj += conf_weight
+        elif dom.get("style") == "distrib":
+            bandar_adj -= conf_weight
+
+    atr_pct = atr_val / max(live_price, 1.0)
+    volatility_adj = 0.0
+    if atr_pct > 0.08:
+        volatility_adj -= 8.0
+    elif atr_pct > 0.05:
+        volatility_adj -= 4.0
+    elif 0.015 <= atr_pct <= 0.04:
+        volatility_adj += 3.0
+
+    prob_entry = clamp_prob(
+        base + grade_bonus + status_adj + trend_adj + momentum_adj
+        + volume_adj + tape_adj + bandar_adj + volatility_adj
+    )
+
+    risk_per_share = max(live_price - stop_loss, 1.0)
+    rr1 = (tp1 - live_price) / risk_per_share
+    rr2 = (tp2 - live_price) / risk_per_share
+    rr3 = (tp3 - live_price) / risk_per_share
+
+    rr_bonus_1 = min(max((rr1 - 1.2) * 6.0, -8.0), 10.0)
+    rr_bonus_2 = min(max((rr2 - 2.0) * 4.0, -10.0), 8.0)
+    rr_bonus_3 = min(max((rr3 - 3.0) * 3.0, -12.0), 6.0)
+
+    prob_tp1 = clamp_prob(prob_entry + rr_bonus_1 - atr_pct * 35.0)
+    prob_tp2 = clamp_prob(prob_entry - 12.0 + rr_bonus_2 - atr_pct * 45.0)
+    prob_tp3 = clamp_prob(prob_entry - 24.0 + rr_bonus_3 - atr_pct * 55.0)
+    prob_sl = 95.0 if live_price <= stop_loss else clamp_prob(100.0 - prob_tp1 + atr_pct * 45.0, 5.0, 90.0)
+
+    return {
+        "Prob Entry": prob_entry,
+        "Prob TP1": prob_tp1,
+        "Prob TP2": prob_tp2,
+        "Prob TP3": prob_tp3,
+        "Prob SL": prob_sl,
+        "Confidence": probability_label(prob_entry),
+    }
+
+
 def pick_best_buy(df: pd.DataFrame) -> tuple[str | None, float, list[str]]:
     """Pilih satu ticker dengan composite best-buy score tertinggi."""
     if df.empty:
@@ -1501,7 +1670,19 @@ def render_best_buy_banner(ticker: str, score: float, reasons: list[str], row: p
     bar_w = min(int(score), 100)
     bar_c = "#ffd700" if score >= 70 else "#e3b341" if score >= 50 else "#8b949e"
 
-    reasons_html = "".join(
+    prob_html = ""
+    if "Prob Entry" in row:
+        prob_html = (
+            f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0.5rem;margin-bottom:0.55rem;'
+            f'background:rgba(255,255,255,0.035);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:0.45rem 0.55rem;">'
+            f'  <div><div class="label">Prob Entry</div><div style="color:#58a6ff;font-weight:900;">{row["Prob Entry"]}%</div></div>'
+            f'  <div><div class="label">Prob TP1</div><div style="color:#3fb950;font-weight:900;">{row["Prob TP1"]}%</div></div>'
+            f'  <div><div class="label">Prob SL</div><div style="color:#f85149;font-weight:900;">{row["Prob SL"]}%</div></div>'
+            f'  <div><div class="label">Confidence</div><div style="color:#e3b341;font-weight:900;">{row["Confidence"]}</div></div>'
+            f'</div>'
+        )
+
+    reasons_html = prob_html + "".join(
         f'<span style="display:inline-block;background:rgba(255,255,255,0.06);'
         f'border-radius:6px;padding:0.1rem 0.4rem;margin:0.1rem;font-size:0.68rem;color:#c9d1d9;">'
         f'{r}</span>'
@@ -1742,6 +1923,15 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
                     f'  <div><div class="label">Trailing Strategy</div>'
                     f'  <div class="ts-rule" style="font-size:0.78rem;">{row["TS Kriteria"]}</div></div>'
                     f'</div>'
+                    f'<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0.35rem;margin-bottom:0.5rem;'
+                    f'background:rgba(88,166,255,0.05);border:1px solid rgba(88,166,255,0.18);border-radius:6px;padding:0.45rem 0.5rem;">'
+                    f'  <div><div class="label">Prob Entry</div><div style="color:#58a6ff;font-weight:800;">{row["Prob Entry"]}%</div></div>'
+                    f'  <div><div class="label">Prob TP1</div><div style="color:#3fb950;font-weight:800;">{row["Prob TP1"]}%</div></div>'
+                    f'  <div><div class="label">Prob SL</div><div style="color:#f85149;font-weight:800;">{row["Prob SL"]}%</div></div>'
+                    f'  <div><div class="label">TP2</div><div style="color:#3fb950;font-weight:700;">{row["Prob TP2"]}%</div></div>'
+                    f'  <div><div class="label">TP3</div><div style="color:#bc8cff;font-weight:700;">{row["Prob TP3"]}%</div></div>'
+                    f'  <div><div class="label">Confidence</div><div style="color:#e3b341;font-weight:800;">{row["Confidence"]}</div></div>'
+                    f'</div>'
                     f'<div style="margin-bottom:0.4rem;background:rgba(255,255,255,0.02);border-radius:6px;padding:0.3rem 0.5rem;border:1px solid #21262d;">'
                     f'  <div class="label" style="margin-bottom:0.15rem;">Rencana Partial Exit</div>'
                     f'  <div style="font-size:0.68rem;color:#c9d1d9;">{row["Partial Plan"]}</div>'
@@ -1939,6 +2129,12 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
                 "R/R":         row["R/R TP1"],
                 "Score":       row["Score"],
                 "Grade":       row["Grade"],
+                "Prob Entry":  f"{row['Prob Entry']}%",
+                "Prob TP1":    f"{row['Prob TP1']}%",
+                "Prob TP2":    f"{row['Prob TP2']}%",
+                "Prob TP3":    f"{row['Prob TP3']}%",
+                "Prob SL":     f"{row['Prob SL']}%",
+                "Confidence":  row["Confidence"],
                 "Status":      _validity_label(row),
                 "Sinyal Bandar": _bandar_label(row),
                 "Tape":        _tape_label(row),
