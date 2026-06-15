@@ -292,6 +292,8 @@ def calculate_adx(df: pd.DataFrame, window: int = 14) -> dict:
 
 
 
+
+def calculate_indicators(df: pd.DataFrame) -> dict:
     """
     Hitung semua indikator sekaligus dan kembalikan sebagai dict scalar.
     Kalkulasi dilakukan sekali, bukan berulang di setiap fungsi scoring.
@@ -1117,8 +1119,8 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         tp2       = plan['tp2']
         tp3       = plan['tp3']
 
-        # Zona beli: buy_max MAKSIMUM di last_close (tidak logis entry di atas harga close)
-        # buy_min = close - 0.5 ATR (support bawah zona), buy_max = close (batas atas)
+        # Zona beli: entry hanya valid di rentang pullback/near-close yang masih memberi R/R sehat.
+        # Risiko dan alokasi dihitung dari buy_max, bukan last_close, agar rencana tidak terlalu optimistis.
         buy_min = snap_to_tick(last_close - 0.5 * ind['atr_val'], "ceil")
         buy_max = snap_to_tick(last_close, "floor")
 
@@ -1129,7 +1131,8 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             buy_max = snap_to_tick(tp1 - 1, "floor")
             buy_min = min(buy_min, buy_max)
 
-        loss_per_share = last_close - stop_loss
+        entry_ref = float(buy_max)
+        loss_per_share = entry_ref - stop_loss
         if loss_per_share <= 0:
             skipped_reason[ticker] = "loss_per_share ≤ 0"
             continue
@@ -1138,10 +1141,10 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         calc_lots      = int(rupiah_risk / loss_per_share / 100)
 
         max_alloc      = config['total_capital'] * (config['max_capital_allocation_pct'] / 100.0)
-        required_cap   = calc_lots * 100 * last_close
+        required_cap   = calc_lots * 100 * entry_ref
         if required_cap > max_alloc:
-            calc_lots    = int(max_alloc / (100 * last_close))
-            required_cap = calc_lots * 100 * last_close
+            calc_lots    = int(max_alloc / (100 * entry_ref))
+            required_cap = calc_lots * 100 * entry_ref
 
         if calc_lots < 1:
             skipped_reason[ticker] = "modal tidak cukup untuk 1 lot"
@@ -1157,13 +1160,13 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             "Buy Min":      buy_min,
             "Buy Max":      buy_max,
             "TP1":          int(tp1),
-            "Upside TP1":   f"+{round((tp1 - last_close) / last_close * 100, 1)}%",
+            "Upside TP1":   f"+{round((tp1 - entry_ref) / entry_ref * 100, 1)}%",
             "TP2":          int(tp2),
-            "Upside TP2":   f"+{round((tp2 - last_close) / last_close * 100, 1)}%",
+            "Upside TP2":   f"+{round((tp2 - entry_ref) / entry_ref * 100, 1)}%",
             "TP3":          int(tp3),
-            "Upside TP3":   f"+{round((tp3 - last_close) / last_close * 100, 1)}%",
+            "Upside TP3":   f"+{round((tp3 - entry_ref) / entry_ref * 100, 1)}%",
             "Stop Loss":    int(stop_loss),
-            "Risk%":        f"-{round((last_close - stop_loss) / last_close * 100, 1)}%",
+            "Risk%":        f"-{round((entry_ref - stop_loss) / entry_ref * 100, 1)}%",
             "R/R TP1":      f"1:{plan['rr1']}",
             "R/R TP2":      f"1:{plan['rr2']}",
             "R/R TP3":      f"1:{plan['rr3']}",
@@ -1214,8 +1217,9 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         sl = row.get("Stop Loss", 0)
         bmin = row.get("Buy Min", 0)
         if lp <= sl:          return 2   # expired → paling bawah
-        elif lp < bmin:       return 1   # waiting → tengah
-        else:                 return 0   # valid   → paling atas
+        elif lp < bmin:       return 1   # waiting below zone → tengah
+        elif lp > row.get("Buy Max", 0): return 1   # chasing above zone → tengah
+        else:                 return 0   # valid inside zone → paling atas
 
     df_out["_validity_rank"] = df_out.apply(_validity_rank, axis=1)
     return (
@@ -1408,7 +1412,10 @@ def compute_best_buy_score(row: pd.Series) -> tuple[float, list[str]]:
     if validity['status'] == 'valid':
         total += 30; reasons.append("✅ Harga dalam zona beli")
     elif validity['status'] == 'waiting':
-        total += 10; reasons.append("⏳ Di bawah zona, SL masih aman")
+        if row["Live Price"] > row["Buy Max"]:
+            total += 4; reasons.append("⏳ Di atas zona, tunggu pullback")
+        else:
+            total += 10; reasons.append("⏳ Di bawah zona, SL masih aman")
     else:
         return 0.0, []   # expired → tidak pernah jadi best buy
 
@@ -1482,8 +1489,12 @@ def render_best_buy_banner(ticker: str, score: float, reasons: list[str], row: p
     validity = _check_signal_validity(
         row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"]
     )
-    status_label = "🟢 Harga dalam zona — siap entry" if validity['status'] == 'valid' \
-                   else "🟡 Di bawah zona — pantau & tunggu"
+    if validity['status'] == 'valid':
+        status_label = "🟢 Harga dalam zona — siap entry"
+    elif row["Live Price"] > row["Buy Max"]:
+        status_label = "🟡 Di atas zona — tunggu pullback"
+    else:
+        status_label = "🟡 Di bawah zona — pantau & tunggu"
     status_color = "#3fb950" if validity['status'] == 'valid' else "#e3b341"
 
     # Confidence bar visual
@@ -1580,6 +1591,20 @@ def _check_signal_validity(live_price: int, stop_loss: int, buy_min: int, buy_ma
             'title':    '⏳ Harga di Bawah Zona Beli',
             'detail':   f'Harga ({lp_fmt}) masih {gap_pct}% di bawah zona ({bmin_fmt}–{bmax_fmt}). SL masih aman — pantau, jangan entry dulu.',
             'action':   'Entry hanya jika harga masuk zona beli.',
+            'card_cls': 'signal-waiting',
+            'banner_cls': 'waiting-banner',
+            'title_color': '#e3b341',
+        }
+    elif live_price > buy_max:
+        gap_pct  = round((live_price - buy_max) / buy_max * 100, 1)
+        bmin_fmt = f"{buy_min:,}".replace(",", ".")
+        bmax_fmt = f"{buy_max:,}".replace(",", ".")
+        lp_fmt   = f"{live_price:,}".replace(",", ".")
+        return {
+            'status':   'waiting',
+            'title':    '⏳ Harga di Atas Zona Beli',
+            'detail':   f'Harga ({lp_fmt}) sudah {gap_pct}% di atas zona ({bmin_fmt}–{bmax_fmt}). R/R memburuk jika dipaksakan entry sekarang.',
+            'action':   'Tunggu pullback ke zona beli atau cari setup lain.',
             'card_cls': 'signal-waiting',
             'banner_cls': 'waiting-banner',
             'title_color': '#e3b341',
