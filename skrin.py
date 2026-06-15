@@ -234,17 +234,23 @@ def calculate_bb_squeeze(df: pd.DataFrame,
 def calculate_indicators(df: pd.DataFrame) -> dict:
     """
     Hitung semua indikator sekaligus dan kembalikan sebagai dict scalar.
-    FIX #5: Semua series dihitung sekali, bukan berulang di setiap fungsi scoring.
+    Kalkulasi dilakukan sekali, bukan berulang di setiap fungsi scoring.
     """
     close  = df['Close']
     volume = df['Volume']
 
-    # EMA trend
+    # EMA trend — tiga level
+    ema200 = close.ewm(span=200, adjust=False).mean()
     ema50  = close.ewm(span=50,  adjust=False).mean()
     ema20  = close.ewm(span=20,  adjust=False).mean()
     last_close = float(close.iloc[-1])
-    above_ema50 = last_close > float(ema50.iloc[-1])
-    above_ema20 = last_close > float(ema20.iloc[-1])
+    above_ema200 = last_close > float(ema200.iloc[-1]) if len(close) >= 200 else True  # insufficient data → assume neutral
+    above_ema50  = last_close > float(ema50.iloc[-1])
+    above_ema20  = last_close > float(ema20.iloc[-1])
+
+    # EMA20 slope — cek apakah tren pendek sedang naik (bandingkan 3 candle terakhir)
+    ema20_vals   = ema20.iloc[-4:].values
+    ema20_rising = float(ema20_vals[-1]) > float(ema20_vals[-3]) if len(ema20_vals) >= 3 else False
 
     # ATR
     atr_series  = calculate_atr(df)
@@ -271,21 +277,22 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
     # Volume spike vs MA-15
     vol_ma15    = float(volume.rolling(15).mean().iloc[-1])
     vol_last    = float(volume.iloc[-1])
-    # FIX #6: Gunakan max(vol_ma15, 1) untuk menghindari division by tiny epsilon
     vol_spike   = vol_last / max(vol_ma15, 1.0)
 
     # ADTV (MA-20 volume × harga)
     vol_ma20    = float(volume.rolling(20).mean().iloc[-1])
     adtv        = vol_ma20 * last_close
 
-    # FIX #7: Tambah guard — atr_val harus positif dan finite
+    # Guard: atr_val harus positif dan finite
     if not np.isfinite(atr_val) or atr_val <= 0:
         raise ValueError(f"ATR tidak valid: {atr_val}")
 
     return {
         'last_close':      last_close,
+        'above_ema200':    above_ema200,
         'above_ema50':     above_ema50,
         'above_ema20':     above_ema20,
+        'ema20_rising':    ema20_rising,
         'atr_val':         atr_val,
         'atr_pct':         atr_pct,
         'cmf_val':         cmf_val,
@@ -627,30 +634,52 @@ def _build_narasi(signals: list, dominant: dict | None) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────
 
 def score_trend(ind: dict) -> tuple[float, str]:
-    """A. Trend filter berbasis EMA50 dan EMA20."""
-    if ind['above_ema50'] and ind['above_ema20']:
-        return 25.0, "bull"
-    elif ind['above_ema50']:
+    """
+    A. Trend filter berbasis EMA200 + EMA50 + EMA20 slope.
+    Bobot max = 25 poin.
+
+    Hierarki:
+    - Di atas EMA50 + EMA20 (bull alignment)          → 20 base
+    - Di atas EMA200 juga (long-term uptrend)         → +3 bonus
+    - EMA20 slope naik (momentum jangka pendek bagus) → +2 bonus
+    - Hanya di atas EMA50                             → 12
+    - Hanya di atas EMA20                             → 5
+    - Di bawah semua                                  → 0, capped di 40 total
+    """
+    above_200 = ind.get('above_ema200', True)
+    above_50  = ind['above_ema50']
+    above_20  = ind['above_ema20']
+    slope_ok  = ind.get('ema20_rising', False)
+
+    if above_50 and above_20:
+        base  = 20.0
+        bonus = (3.0 if above_200 else 0.0) + (2.0 if slope_ok else 0.0)
+        return min(base + bonus, 25.0), "bull"
+    elif above_50:
         return 12.0, "bull"
-    elif ind['above_ema20']:
-        return 5.0,  "neut"
+    elif above_20:
+        return 5.0, "neut"
     else:
-        return 0.0,  "bear"
+        return 0.0, "bear"
 
 def score_rsi(ind: dict) -> tuple[float, str]:
     """
     B. RSI 14.
-    - Zona ideal setup: 40–65
-    - RSI > 75 = overbought → penalty
-    - FIX #8: Base 20 + bonus 5 bisa melebihi cap 20 — dibatasi min() sudah benar
-              tapi logika bonus harusnya hanya aktif di zona sweet spot.
+    - Zona ideal setup: 40–65  → skor 15 base + bonus 5 jika rising  = maks 20
+    - RSI 65–75 (hangat)       → 10 flat, tidak ada bonus
+    - RSI 30–40 (oversold warning) → 8 flat
+    - RSI > 75 (overbought)    → penalti berat 2
+    - RSI < 30 (ekstrem oversold)  → 4
+    Bonus rising HANYA aktif di zona 40–65 agar tidak mendorong skor
+    di zona yang seharusnya netral.
     """
     rsi = ind['rsi_val']
     if rsi > 75:
         return 2.0, "bear"
     elif 40 <= rsi <= 65:
+        base  = 10.0 + (rsi - 40) / 25.0 * 5.0   # linear 10→15 di zona sweet spot
         bonus = 5.0 if ind['rsi_rising'] else 0.0
-        return min(20.0 + bonus, 20.0), "bull"   # bonus tidak pernah membuat > 20
+        return min(base + bonus, 20.0), "bull"
     elif 65 < rsi <= 75:
         return 10.0, "neut"
     elif 30 <= rsi < 40:
@@ -714,6 +743,9 @@ def compute_total_score(ind: dict) -> tuple[float, dict]:
 
     if not ind['above_ema50'] and not ind['above_ema20']:
         total = min(total, 40.0)
+    # Penalti tambahan jika di bawah EMA200 (downtrend jangka panjang)
+    if not ind.get('above_ema200', True) and not ind['above_ema50']:
+        total = min(total, 35.0)
 
     breakdown = {
         'trend':   (round(st_score, 1), st_sig),
@@ -728,20 +760,22 @@ def compute_total_score(ind: dict) -> tuple[float, dict]:
 # 6. TRADING PLAN: ATR-BASED + MINIMUM R/R GUARANTEE
 # =============================================================================
 INTRADAY_PARAMS = {
-    'atr_window':  14,
-    'atr_sl_mult': 1.5,
-    'min_rr1':     1.5,
-    'min_rr2':     2.5,
-    'ts_rule':     "Trailing 1× ATR; geser ke BEP saat TP1 hit",
+    'atr_window':     14,
+    'atr_sl_mult':    1.5,
+    'min_rr1':        1.5,
+    'min_rr2':        2.5,
+    'min_rr3':        4.0,
+    'ts_rule':        "Trailing 1× ATR; geser ke BEP saat TP1 hit",
     'fixed_risk_pct': 3.0,
 }
 
 SWING_PARAMS = {
-    'atr_window':  14,
-    'atr_sl_mult': 2.0,
-    'min_rr1':     2.0,
-    'min_rr2':     3.5,
-    'ts_rule':     "Set BEP saat TP1 hit; trailing 2× ATR",
+    'atr_window':     14,
+    'atr_sl_mult':    2.0,
+    'min_rr1':        2.0,
+    'min_rr2':        3.5,
+    'min_rr3':        5.5,
+    'ts_rule':        "Set BEP saat TP1 hit; trailing 2× ATR menuju TP2",
     'fixed_risk_pct': 5.0,
 }
 
@@ -750,37 +784,53 @@ def build_trade_plan(last_close: float, atr_val: float, mode_params: dict) -> di
     Hitung level TP/SL dengan:
     1. SL berbasis ATR (volatilitas aktual)
     2. TP dijamin memenuhi minimum R/R ratio
-    3. Fallback ke persen flat jika ATR tidak valid
+    3. TP3 sebagai extended target (runner position)
+    4. Fallback ke persen flat jika ATR tidak valid
+    5. Guard: SL tidak negatif, semua level konsisten
 
-    FIX #10: stop_loss bisa bernilai negatif jika ATR > last_close → guard ditambah.
+    Partial Exit Plan (standar):
+    - TP1 → exit 40% posisi, geser SL ke BEP
+    - TP2 → exit 40% posisi, biarkan sisa runner
+    - TP3 → exit sisa (20%) atau trailing stop
     """
     sl_dist = atr_val * mode_params['atr_sl_mult']
+    # SL minimum: setengah dari fixed_risk_pct agar tidak terlalu ketat
     min_sl_dist = last_close * (mode_params['fixed_risk_pct'] / 100.0) * 0.5
     sl_dist = max(sl_dist, min_sl_dist)
 
-    # FIX #10: pastikan SL tidak negatif (misal saham murah + ATR besar)
+    # Guard: SL tidak boleh menghasilkan harga negatif
     stop_loss_raw = last_close - sl_dist
     if stop_loss_raw <= 0:
-        sl_dist   = last_close * 0.95    # fallback: SL 5% di bawah harga
+        sl_dist       = last_close * 0.95    # fallback: SL 5% di bawah harga
         stop_loss_raw = last_close - sl_dist
 
-    tp1_dist = sl_dist * mode_params['min_rr1']
+    # Guard: R/R minimum 1.5 untuk TP1 (absolut)
+    tp1_dist = max(sl_dist * mode_params['min_rr1'], sl_dist * 1.5)
     tp2_dist = sl_dist * mode_params['min_rr2']
+    tp3_dist = sl_dist * mode_params['min_rr3']
 
     tp1 = last_close + tp1_dist
     tp2 = last_close + tp2_dist
+    tp3 = last_close + tp3_dist
 
-    rr1_actual = tp1_dist / sl_dist
-    rr2_actual = tp2_dist / sl_dist
+    rr1_actual = round(tp1_dist / sl_dist, 2)
+    rr2_actual = round(tp2_dist / sl_dist, 2)
+    rr3_actual = round(tp3_dist / sl_dist, 2)
+
+    # Partial exit allocation
+    partial_plan = "TP1: exit 40% → geser SL ke BEP | TP2: exit 40% | TP3/Trail: sisa 20%"
 
     return {
-        'stop_loss': float(np.floor(stop_loss_raw)),
-        'tp1':       float(np.ceil(tp1)),
-        'tp2':       float(np.ceil(tp2)),
-        'sl_dist':   sl_dist,
-        'rr1':       round(rr1_actual, 2),
-        'rr2':       round(rr2_actual, 2),
-        'ts_rule':   mode_params['ts_rule'],
+        'stop_loss':    float(np.floor(stop_loss_raw)),
+        'tp1':          float(np.ceil(tp1)),
+        'tp2':          float(np.ceil(tp2)),
+        'tp3':          float(np.ceil(tp3)),
+        'sl_dist':      sl_dist,
+        'rr1':          rr1_actual,
+        'rr2':          rr2_actual,
+        'rr3':          rr3_actual,
+        'ts_rule':      mode_params['ts_rule'],
+        'partial_plan': partial_plan,
     }
 
 # =============================================================================
@@ -946,12 +996,19 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         stop_loss = plan['stop_loss']
         tp1       = plan['tp1']
         tp2       = plan['tp2']
+        tp3       = plan['tp3']
 
         buy_min = int(np.floor(last_close - 0.5 * ind['atr_val']))
         buy_max = int(np.ceil(last_close + 0.3 * ind['atr_val']))
 
-        # FIX #15: buy_min tidak boleh < stop_loss (entry di bawah SL tidak logis)
+        # Guard: buy_min tidak boleh < stop_loss (entry di bawah SL tidak logis)
         buy_min = max(buy_min, int(stop_loss) + 1)
+        # Guard: buy_max harus >= buy_min (mencegah zona terbalik)
+        buy_max = max(buy_max, buy_min + 1)
+        # Guard: buy_max tidak boleh >= TP1 (entry harus di bawah target)
+        if buy_max >= tp1:
+            buy_max = int(tp1) - 1
+            buy_min = min(buy_min, buy_max - 1)
 
         loss_per_share = last_close - stop_loss
         if loss_per_share <= 0:
@@ -984,14 +1041,18 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             "Upside TP1":   f"+{round((tp1 - last_close) / last_close * 100, 1)}%",
             "TP2":          int(tp2),
             "Upside TP2":   f"+{round((tp2 - last_close) / last_close * 100, 1)}%",
+            "TP3":          int(tp3),
+            "Upside TP3":   f"+{round((tp3 - last_close) / last_close * 100, 1)}%",
             "Stop Loss":    int(stop_loss),
             "Risk%":        f"-{round((last_close - stop_loss) / last_close * 100, 1)}%",
             "R/R TP1":      f"1:{plan['rr1']}",
             "R/R TP2":      f"1:{plan['rr2']}",
+            "R/R TP3":      f"1:{plan['rr3']}",
             "ATR":          round(ind['atr_val'], 1),
             "RSI":          round(ind['rsi_val'], 1),
             "CMF":          round(ind['cmf_val'], 3),
             "TS Kriteria":  plan['ts_rule'],
+            "Partial Plan": plan['partial_plan'],
             "Lots":         int(calc_lots),
             "Alokasi (Rp)": required_cap,
             "_breakdown":   breakdown,
@@ -1155,12 +1216,14 @@ def _price_status_html(live_price: int, ref_close: int, buy_min: int, buy_max: i
         diff_pct = diff / ref_close * 100
         sign     = "+" if diff >= 0 else ""
         ref_col  = "#3fb950" if diff >= 0 else "#f85149"
-        # FIX #16: f-string terputus di tengah (concatenation aneh) — disatukan
+        ref_close_fmt = f"{ref_close:,}".replace(",", ".")
         ref_note = (
             f'<span style="font-size:0.68rem;color:{ref_col};margin-left:0.3rem;">'
-            f'{sign}{diff_pct:.1f}% vs ref {ref_close:,}'.replace(",", ".") +
-            '</span>'
+            f'{sign}{diff_pct:.1f}% vs ref {ref_close_fmt}'
+            f'</span>'
         )
+
+    live_price_fmt = f"{live_price:,}".replace(",", ".")
 
     return (
         f'<div style="display:flex;align-items:center;justify-content:space-between;'
@@ -1169,7 +1232,7 @@ def _price_status_html(live_price: int, ref_close: int, buy_min: int, buy_max: i
         f'border-left:3px solid {color};">'
         f'  <div style="display:flex;align-items:baseline;gap:0.4rem;flex-wrap:wrap;">'
         f'    <span style="font-size:1.3rem;font-weight:800;color:{color};">'
-        f'      {live_price:,}'.replace(",", ".") +
+        f'      {live_price_fmt}'
         f'    </span>'
         f'    {ref_note}'
         f'  </div>'
@@ -1226,14 +1289,13 @@ def compute_best_buy_score(row: pd.Series) -> tuple[float, list[str]]:
     dom    = bandar.get("dominant")
     if dom:
         conf_pts = {"high": 15, "med": 8, "low": 3}.get(dom.get("conf", "low"), 3)
-        # Hanya akumulasi / markup yang bernilai positif; distribusi dikurangi
-        if dom.get("style") in ("distrib",):
-            conf_pts = -5
-            reasons.append(f"⚠️ Sinyal distribusi bandar terdeteksi")
+        if dom.get("style") == "distrib":
+            # Distribusi = penalti; kurangi langsung (conf_pts tidak dipakai positif)
+            total -= 5
+            reasons.append("⚠️ Sinyal distribusi bandar terdeteksi")
         else:
             total += conf_pts
             reasons.append(f"🔍 Bandar: {dom.get('label','')} ({dom.get('conf','')})")
-        total += conf_pts if dom.get("style") not in ("distrib",) else 0
     else:
         reasons.append("— Tidak ada sinyal bandar")
 
@@ -1297,6 +1359,12 @@ def render_best_buy_banner(ticker: str, score: float, reasons: list[str], row: p
         for r in reasons
     )
 
+    lp_fmt  = f"{int(row['Live Price']):,}".replace(",", ".")
+    bmin_fmt = f"{int(row['Buy Min']):,}".replace(",", ".")
+    bmax_fmt = f"{int(row['Buy Max']):,}".replace(",", ".")
+    sl_fmt  = f"{int(row['Stop Loss']):,}".replace(",", ".")
+    tp1_fmt = f"{int(row['TP1']):,}".replace(",", ".")
+
     html = (
         f'<div class="best-buy-banner">'
         f'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">'
@@ -1320,13 +1388,13 @@ def render_best_buy_banner(ticker: str, score: float, reasons: list[str], row: p
         f'<div style="margin-top:0.5rem;padding-top:0.4rem;border-top:1px solid rgba(255,215,0,0.2);'
         f'display:grid;grid-template-columns:repeat(4,1fr);gap:0.4rem;font-size:0.72rem;">'
         f'  <div><div style="color:#8b949e;font-size:0.6rem;">HARGA LIVE</div>'
-        f'  <div style="color:#fff;font-weight:700;">{int(row["Live Price"]):,}'.replace(",",".") + f'</div></div>'
+        f'  <div style="color:#fff;font-weight:700;">{lp_fmt}</div></div>'
         f'  <div><div style="color:#8b949e;font-size:0.6rem;">ZONA BELI</div>'
-        f'  <div style="color:#fff;font-weight:700;">{int(row["Buy Min"]):,}–{int(row["Buy Max"]):,}'.replace(",",".") + f'</div></div>'
+        f'  <div style="color:#fff;font-weight:700;">{bmin_fmt}–{bmax_fmt}</div></div>'
         f'  <div><div style="color:#8b949e;font-size:0.6rem;">STOP LOSS</div>'
-        f'  <div style="color:#f85149;font-weight:700;">{int(row["Stop Loss"]):,}'.replace(",",".") + f'</div></div>'
+        f'  <div style="color:#f85149;font-weight:700;">{sl_fmt}</div></div>'
         f'  <div><div style="color:#8b949e;font-size:0.6rem;">TARGET TP1</div>'
-        f'  <div style="color:#3fb950;font-weight:700;">{int(row["TP1"]):,} <span style="font-size:0.65rem;">{row["Upside TP1"]}</span></div></div>'.replace(",",".") +
+        f'  <div style="color:#3fb950;font-weight:700;">{tp1_fmt} <span style="font-size:0.65rem;">{row["Upside TP1"]}</span></div></div>'
         f'</div>'
         f'</div>'
     )
@@ -1481,18 +1549,24 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
                     f'{dim_open}'
                     f'<div class="price-range">{int(row["Buy Min"])} – {int(row["Buy Max"])}</div>'
                     f'<div class="label" style="margin-bottom:0.6rem;">Area Rentang Buy · ATR {row["ATR"]}</div>'
-                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;'
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0.4rem;'
                     f'margin-bottom:0.6rem;border-top:1px solid #30363d;padding-top:0.4rem;">'
                     f'  <div><div class="label">TP 1 <span class="rr-badge">({row["R/R TP1"]})</span></div>'
                     f'  <div class="tp">{int(row["TP1"])} <span style="font-size:0.68rem;opacity:0.8">{row["Upside TP1"]}</span></div></div>'
                     f'  <div><div class="label">TP 2 <span class="rr-badge">({row["R/R TP2"]})</span></div>'
                     f'  <div class="tp">{int(row["TP2"])} <span style="font-size:0.68rem;opacity:0.8">{row["Upside TP2"]}</span></div></div>'
+                    f'  <div><div class="label">TP 3 <span class="rr-badge">({row["R/R TP3"]})</span></div>'
+                    f'  <div class="tp" style="color:#bc8cff;">{int(row["TP3"])} <span style="font-size:0.68rem;opacity:0.8">{row["Upside TP3"]}</span></div></div>'
                     f'</div>'
-                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;margin-bottom:0.6rem;">'
+                    f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;margin-bottom:0.4rem;">'
                     f'  <div><div class="label">Stop Loss</div>'
                     f'  <div class="sl">{int(row["Stop Loss"])} <span style="font-size:0.68rem;opacity:0.8">{row["Risk%"]}</span></div></div>'
                     f'  <div><div class="label">Trailing Strategy</div>'
                     f'  <div class="ts-rule" style="font-size:0.78rem;">{row["TS Kriteria"]}</div></div>'
+                    f'</div>'
+                    f'<div style="margin-bottom:0.4rem;background:rgba(255,255,255,0.02);border-radius:6px;padding:0.3rem 0.5rem;border:1px solid #21262d;">'
+                    f'  <div class="label" style="margin-bottom:0.15rem;">Rencana Partial Exit</div>'
+                    f'  <div style="font-size:0.68rem;color:#c9d1d9;">{row["Partial Plan"]}</div>'
                     f'</div>'
                     f'<div style="border-top:1px solid #30363d;padding-top:0.4rem;'
                     f'display:grid;grid-template-columns:1fr 1fr;gap:0.3rem;font-size:0.75rem;">'
@@ -1679,6 +1753,7 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
                 "Zona Beli":   f"Rp {int(row['Buy Min']):,} – {int(row['Buy Max']):,}".replace(",", "."),
                 "Target 1":    f"Rp {int(row['TP1']):,} ({row['Upside TP1']})".replace(",", "."),
                 "Target 2":    f"Rp {int(row['TP2']):,} ({row['Upside TP2']})".replace(",", "."),
+                "Target 3":    f"Rp {int(row['TP3']):,} ({row['Upside TP3']})".replace(",", "."),
                 "Stop Loss":   f"Rp {int(row['Stop Loss']):,} ({row['Risk%']})".replace(",", "."),
                 "R/R":         row["R/R TP1"],
                 "Score":       row["Score"],
