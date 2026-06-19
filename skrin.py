@@ -306,7 +306,8 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
     ema50  = close.ewm(span=50,  adjust=False).mean()
     ema20  = close.ewm(span=20,  adjust=False).mean()
     last_close = float(close.iloc[-1])
-    above_ema200 = last_close > float(ema200.iloc[-1]) if len(close) >= 200 else True  # insufficient data → assume neutral
+    ema200_available = len(close) >= 200
+    above_ema200 = last_close > float(ema200.iloc[-1]) if ema200_available else False
     above_ema50  = last_close > float(ema50.iloc[-1])
     above_ema20  = last_close > float(ema20.iloc[-1])
 
@@ -356,6 +357,7 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
 
     return {
         'last_close':      last_close,
+        'ema200_available': ema200_available,
         'above_ema200':    above_ema200,
         'above_ema50':     above_ema50,
         'above_ema20':     above_ema20,
@@ -715,14 +717,15 @@ def score_trend(ind: dict) -> tuple[float, str]:
     - Hanya di atas EMA20                             → 5
     - Di bawah semua                                  → 0, capped di 40 total
     """
-    above_200 = ind.get('above_ema200', True)
+    ema200_available = ind.get('ema200_available', False)
+    above_200 = ind.get('above_ema200', False)
     above_50  = ind['above_ema50']
     above_20  = ind['above_ema20']
     slope_ok  = ind.get('ema20_rising', False)
 
     if above_50 and above_20:
         base  = 20.0
-        bonus = (3.0 if above_200 else 0.0) + (2.0 if slope_ok else 0.0)
+        bonus = (3.0 if ema200_available and above_200 else 0.0) + (2.0 if slope_ok else 0.0)
         return min(base + bonus, 25.0), "bull"
     elif above_50:
         return 12.0, "bull"
@@ -825,7 +828,7 @@ def compute_total_score(ind: dict) -> tuple[float, dict]:
     if not ind['above_ema50'] and not ind['above_ema20']:
         total = min(total, 40.0)
     # Penalti tambahan jika di bawah EMA200 (downtrend jangka panjang)
-    if not ind.get('above_ema200', True) and not ind['above_ema50']:
+    if ind.get('ema200_available', False) and not ind.get('above_ema200', False) and not ind['above_ema50']:
         total = min(total, 35.0)
 
     breakdown = {
@@ -964,7 +967,8 @@ def download_ticker_chunk(tickers: list, period_days: int, interval: str) -> dic
              pada MultiIndex vs flat columns.
     """
     start_date = (datetime.now() - timedelta(days=period_days)).strftime('%Y-%m-%d')
-    end_date   = datetime.now().strftime('%Y-%m-%d')
+    # yfinance treats end as exclusive; add one day so the latest candle is included.
+    end_date   = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
     chunk_results = {}
 
     def _safe_extract(data, ticker):
@@ -1044,7 +1048,12 @@ def fetch_live_prices(tickers_jk: list, max_workers: int = 8) -> dict:
     result = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_fetch_one_live, t): t for t in tickers_jk}
-        for future in concurrent.futures.as_completed(futures, timeout=30):
+        done, pending = concurrent.futures.wait(
+            futures, timeout=30, return_when=concurrent.futures.ALL_COMPLETED
+        )
+        for future in pending:
+            future.cancel()
+        for future in done:
             try:
                 ticker, price = future.result()
                 if price is not None:
@@ -1204,6 +1213,7 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             "_vol_ctx":     vol_ctx,
             "_tape":        tape,
             "_bandar":      bandar,
+            "_ind":         ind,
         })
 
     # Simpan summary ke session state untuk debug view
@@ -1229,6 +1239,27 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         else:
             r["Live Price"] = int(r["Last Price"])  # fallback ke harga terakhir data
             r["Live Src"]   = "delayed"
+
+        # Recalculate probability with the actual live/delayed price.
+        # Initial probabilities were based on planned entry; this keeps status,
+        # Best Buy, and tables honest when price moves outside the buy zone.
+        live_probs = estimate_trade_probabilities(
+            score=r["Score"],
+            grade=r["Grade"],
+            live_price=float(r["Live Price"]),
+            buy_min=float(r["Buy Min"]),
+            buy_max=float(r["Buy Max"]),
+            stop_loss=float(r["Stop Loss"]),
+            tp1=float(r["TP1"]),
+            tp2=float(r["TP2"]),
+            tp3=float(r["TP3"]),
+            atr_val=float(r["ATR"]),
+            ind=r.get("_ind", {}),
+            vol_ctx=r.get("_vol_ctx", {}),
+            tape=r.get("_tape", {}),
+            bandar=r.get("_bandar", {}),
+        )
+        r.update(live_probs)
         del r["_ticker_jk"]
 
     df_out = pd.DataFrame(results)
@@ -1247,7 +1278,7 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
     df_out["_validity_rank"] = df_out.apply(_validity_rank, axis=1)
     return (
         df_out
-        .sort_values(by=["_validity_rank", "Score"], ascending=[True, False])
+        .sort_values(by=["_validity_rank", "Prob Entry", "Score"], ascending=[True, False, False])
         .drop(columns=["_validity_rank"])
         .reset_index(drop=True)
     )
@@ -1614,6 +1645,8 @@ def estimate_trade_probabilities(
         base + grade_bonus + status_adj + trend_adj + momentum_adj
         + volume_adj + tape_adj + bandar_adj + volatility_adj
     )
+    if live_price <= stop_loss:
+        prob_entry = min(prob_entry, 15.0)
 
     risk_per_share = max(live_price - stop_loss, 1.0)
     rr1 = (tp1 - live_price) / risk_per_share
@@ -1644,12 +1677,14 @@ def pick_best_buy(df: pd.DataFrame) -> tuple[str | None, float, list[str]]:
     if df.empty:
         return None, 0.0, []
 
-    best_ticker, best_score, best_reasons = None, -1.0, []
+    best_ticker, best_score, best_reasons = None, 0.0, []
     for _, row in df.iterrows():
         s, r = compute_best_buy_score(row)
-        if s > best_score:
+        if r and s > best_score:
             best_score, best_reasons, best_ticker = s, r, row["Ticker"]
 
+    if best_ticker is None or best_score <= 0:
+        return None, 0.0, []
     return best_ticker, best_score, best_reasons
 
 
@@ -1736,8 +1771,8 @@ def _check_signal_validity(live_price: int, stop_loss: int, buy_min: int, buy_ma
     Tentukan status validitas sinyal berdasarkan harga live vs level kunci.
 
     Status:
-    - 'valid'   : harga di dalam atau di atas zona beli, di atas SL → normal
-    - 'waiting' : harga di bawah zona beli tapi masih di atas SL → belum saatnya entry
+    - 'valid'   : harga berada di dalam zona beli dan masih di atas SL → siap entry
+    - 'waiting' : harga di bawah/di atas zona beli tapi masih di atas SL → tunggu
     - 'expired' : harga menembus SL dengan margin > 1.5% → sinyal tidak valid
 
     Buffer 1.5% diterapkan pada expired check untuk mengakomodasi noise
