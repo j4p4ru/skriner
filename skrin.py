@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener AI v8.0",
+    page_title="Quant Trader - IDX Screener AI v8.1",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -641,8 +641,13 @@ def _render_volume_ctx(vc):
 
 def _render_tape_bandar(tape, bandar):
     p = []
-    if tape.get('signals'): p.append(f'<div style="margin-bottom:0.25rem;"><span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;margin-right:0.3rem;">Tape</span>{"".join(_tape_pill(s[3],s[1],s[4]) for s in tape["signals"][:4])}</div>')
-    if bandar.get('signals'): p.append(f'<div style="display:flex;align-items:center;gap:0.3rem;flex-wrap:wrap;margin-bottom:0.25rem;"><span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;">Bandar</span>{"".join(_tape_pill(s["short"],s["style"],s["conf_pct"]) for s in bandar["signals"][:3])}{_conf_badge(bandar["dominant"]["conf"]) if bandar.get("dominant") else ""}</div>')
+    if tape.get('signals'): 
+        pills = "".join(_tape_pill(s[3],s[1],s[4]) for s in tape["signals"][:4])
+        p.append(f'<div style="margin-bottom:0.25rem;"><span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;margin-right:0.3rem;">Tape</span>{pills}</div>')
+    if bandar.get('signals'): 
+        pills = "".join(_tape_pill(s["short"],s["style"],s["conf_pct"]) for s in bandar["signals"][:3])
+        conf = _conf_badge(bandar["dominant"]["conf"]) if bandar.get("dominant") else ""
+        p.append(f'<div style="display:flex;align-items:center;gap:0.3rem;flex-wrap:wrap;margin-bottom:0.25rem;"><span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;">Bandar</span>{pills}{conf}</div>')
     if bandar.get('narasi_tech'): p.append(f'<div style="background:rgba(255,255,255,0.02);border-left:2px solid #30363d;padding:0.3rem 0.5rem;border-radius:0 4px 4px 0;"><div class="narasi-tech">"{bandar["narasi_tech"]}"</div><div class="narasi-plain">→ {bandar["narasi_plain"]}</div></div>')
     return f'<div class="section-divider"></div><div style="margin-bottom:0.4rem;">{"".join(p)}</div>' if p else ''
 
@@ -652,7 +657,8 @@ def _price_status(lp, rc, bmin, bmax, src):
     rn = ""
     if rc != lp:
         d = lp - rc; dp = d / rc * 100; s = "+" if d >= 0 else ""
-        rn = f'<span style="font-size:0.68rem;color:{"#3fb950" if d>=0 else "#f85149"};margin-left:0.3rem;">{s}{dp:.1f}% vs ref {fmt_num(rc)}</span>'
+        col = "#3fb950" if d>=0 else "#f85149"
+        rn = f'<span style="font-size:0.68rem;color:{col};margin-left:0.3rem;">{s}{dp:.1f}% vs ref {fmt_num(rc)}</span>'
     return f'''<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.4rem;padding:0.35rem 0.6rem;background:rgba(255,255,255,0.04);border-radius:6px;border-left:3px solid {c};">
         <div style="display:flex;align-items:baseline;gap:0.4rem;flex-wrap:wrap;"><span style="font-size:1.3rem;font-weight:800;color:{c};">{fmt_num(lp)}</span>{rn}</div>
         <div style="text-align:right;"><div style="font-size:0.65rem;color:{sc};font-weight:700;">{sl}</div><div style="font-size:0.65rem;color:{c};font-weight:600;">{i} {l}</div></div></div>'''
@@ -670,15 +676,31 @@ def analyze_with_glm(api_key, stocks_data):
     
     data_str = ""
     for s in stocks_data:
+        # Pre-compute complex expressions to avoid f-string parsing issues in Python < 3.12
+        tape_sigs = s.get('_tape', {}).get('signals', [])
+        tape_str = ", ".join([sig[2] for sig in tape_sigs]) if tape_sigs else 'Tidak ada'
+        
+        dom = s.get('_bandar', {}).get('dominant')
+        bandar_str = f"{dom['label']} ({dom['conf']})" if dom else 'Tidak ada sinyal bandar'
+        
+        adx_dir = 'Bullish' if s['ADX Bullish'] else 'Bearish'
+        vol_ctx = s.get('_vol_ctx', {})
+        vol_ratio = vol_ctx.get('vol_ratio', 0)
+        candle_dir = vol_ctx.get('candle_dir', 'N/A')
+        
+        tp1_str = f"{fmt_num(s['TP1'])} ({s['Upside TP1']})"
+        tp2_str = f"{fmt_num(s['TP2'])} ({s['Upside TP2']})"
+        tp3_str = f"{fmt_num(s['TP3'])} ({s['Upside TP3']})"
+        
         data_str += f"""
         Saham: {s['Ticker']} (Rating: {s['Rating']}, Grade: {s['Grade']})
         - Harga Live: {fmt_num(s['Live Price'])}, Zona Beli: {fmt_num(s['Buy Min'])}-{fmt_num(s['Buy Max'])}
-        - Target: TP1={fmt_num(s['TP1'])} ({s['Upside TP1']}), TP2={fmt_num(s['TP2'])} ({s['Upside TP2']}), TP3={fmt_num(s['TP3'])} ({s['Upside TP3'])})
+        - Target: TP1={tp1_str}, TP2={tp2_str}, TP3={tp3_str}
         - Stop Loss: {fmt_num(s['Stop Loss'])} ({s['Risk%']}), R/R TP1: {s['R/R TP1']}
-        - Indikator: ADX={s['ADX']} ({s['ADX Strength']} {'Bullish' if s['ADX Bullish'] else 'Bearish'}), RSI={s['RSI']}, CMF={s['CMF']}
-        - Volume Context: Ratio={s['_vol_ctx']['vol_ratio']}x, Candle={s['_vol_ctx']['candle_dir']}
-        - Tape Reading: {", ".join([sig[2] for sig in s['_tape']['signals']]) if s['_tape']['signals'] else 'Tidak ada'}
-        - Bandarmology: {s['_bandar']['dominant']['label'] + ' (' + s['_bandar']['dominant']['conf'] + ')' if s['_bandar'].get('dominant') else 'Tidak ada sinyal bandar'}
+        - Indikator: ADX={s['ADX']} ({s['ADX Strength']} {adx_dir}), RSI={s['RSI']}, CMF={s['CMF']}
+        - Volume Context: Ratio={vol_ratio}x, Candle={candle_dir}
+        - Tape Reading: {tape_str}
+        - Bandarmology: {bandar_str}
         """
         
     user_prompt = f"""
@@ -693,7 +715,7 @@ def analyze_with_glm(api_key, stocks_data):
     """
     
     payload = {
-        "model": "glm-4-flash", # Menggunakan flash untuk kecepatan, bisa diganti glm-4 untuk lebih maksimal
+        "model": "glm-4-flash",
         "messages": [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt}
