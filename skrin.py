@@ -617,8 +617,11 @@ def _tape_pill(s, st, c): return f'<span class="tape-pill tape-{st}">{s} {c}%</s
 def _conf_badge(c): 
     cls, lbl = {'high':('conf-hi','▲ Tinggi'),'med':('conf-med','◆ Sedang'),'low':('conf-lo','● Rendah')}.get(c,('conf-lo','—'))
     return f'<span class="{cls}">{lbl}</span>'
+    
 def _adx_info(a, s, b): 
-    return f'<span class="adx-info">ADX {a:.0f} {"▲" if b else "▼"} {{"strong":"Kuat","moderate":"Sedang","weak":"Lemah"}.get(s,"—")}</span>'
+    lbl = {"strong": "Kuat", "moderate": "Sedang", "weak": "Lemah"}.get(s, "—")
+    return f'<span class="adx-info">ADX {a:.0f} {"▲" if b else "▼"} {lbl}</span>'
+    
 def _grade_badge(g): return f'<span class="grade-{g}">Grade {g}</span>'
 
 def _render_volume_ctx(vc):
@@ -896,14 +899,20 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
         def _vl(row): 
             v = _check_signal_validity(row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"])
             return {"valid": "✅ Siap Entry", "waiting": "⏳ Tunggu Dulu", "expired": "🚫 Hindari"}[v["status"]]
+            
         def _bl(row): 
             dom = row.get("_bandar", {}).get("dominant")
-            return f"{{'high':'🔴','med':'🟡','low':'⚪'}.get(dom['conf'],'')} {dom['label']}" if dom else "—"
+            if not dom: return "—"
+            icon = {'high':'🔴','med':'🟡','low':'⚪'}.get(dom['conf'], '')
+            return f"{icon} {dom['label']}"
+            
         def _tl(row): 
             sigs = row.get("_tape", {}).get("signals", [])
             return sigs[0][2] if sigs else "—"
+            
         def _al(row): 
-            return f"{row['ADX']:.0f} {'▲' if row.get('ADX Bullish') else '▼'} ({ {'strong':'Kuat','moderate':'Sedang','weak':'Lemah'}.get(row.get('ADX Strength','weak'),'—')})"
+            stg = {'strong':'Kuat','moderate':'Sedang','weak':'Lemah'}.get(row.get('ADX Strength','weak'), '—')
+            return f"{row['ADX']:.0f} {'▲' if row.get('ADX Bullish') else '▼'} ({stg})"
 
         tabel_rows = []
         for _, row in final_df.iterrows():
