@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener AI (Gemini) v9.1",
+    page_title="Quant Trader - IDX Screener AI (Gemini) v9.2",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -669,7 +669,8 @@ def _price_status(lp, rc, bmin, bmax, src):
 def analyze_with_gemini(api_key, stocks_data):
     if not api_key or not stocks_data: return None
     
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    # FIX: Menggunakan model 'gemini-1.5-flash-latest' agar tidak 404 NOT_FOUND
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
     
     sys_prompt = "Anda adalah Trader Proprietary Senior dan Analis Bandarmology di Bursa Efek Indonesia (BEI). Tugas Anda adalah mengaudit seluruh daftar hasil skrining kuantitatif, membedah narasi di balik angka, mendeteksi potensi jebakan, dan memilih saham paling superior. Gunakan Bahasa Indonesia yang profesional, tegas, dan to-the-point."
@@ -961,7 +962,7 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
     else:
         st.info("ℹ️ Tidak ada saham yang lolos filter pada scan ini.")
 
-    # ── AI Co-Pilot Execution (Gemini 1.5 Flash) ──────────────────────────
+    # ── AI Co-Pilot Execution (Gemini 1.5 Flash Latest) ──────────────────
     if ai_analyze_btn and gemini_api_key and not final_df.empty:
         with st.spinner(f"🤖 AI Co-Pilot (Gemini 1.5 Flash) sedang menganalisa {len(final_df)} saham hasil skrining..."):
             all_data = final_df.to_dict(orient='records')
