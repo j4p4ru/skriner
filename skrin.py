@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener AI v8.3",
+    page_title="Quant Trader - IDX Screener AI v8.4",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -708,7 +708,7 @@ def analyze_with_glm(api_key, stocks_data):
     """
     
     payload = {
-        "model": "glm-4-flash", # Menggunakan flash untuk kecepatan, bisa diganti glm-4 untuk lebih maksimal
+        "model": "glm-4",  # FIX: Ganti dari glm-4-flash ke glm-4
         "messages": [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt}
