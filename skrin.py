@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener AI v8.2",
+    page_title="Quant Trader - IDX Screener AI v8.3",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -664,7 +664,7 @@ def _price_status(lp, rc, bmin, bmax, src):
         <div style="text-align:right;"><div style="font-size:0.65rem;color:{sc};font-weight:700;">{sl}</div><div style="font-size:0.65rem;color:{c};font-weight:600;">{i} {l}</div></div></div>'''
 
 # =============================================================================
-# 11. AI INTEGRATION (GLM-4 CO-PILOT)
+# 11. AI INTEGRATION (GLM-4 CO-PILOT - ANALISA SEMUA SAHAM)
 # =============================================================================
 def analyze_with_glm(api_key, stocks_data):
     if not api_key or not stocks_data: return None
@@ -672,16 +672,16 @@ def analyze_with_glm(api_key, stocks_data):
     url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     
-    sys_prompt = "Anda adalah Trader Proprietary Senior dan Analis Bandarmology di Bursa Efek Indonesia (BEI). Tugas Anda adalah menganalisa data kuantitatif yang diberikan, menemukan narasi tersembunyi di balik angka tersebut, mendeteksi potensi jebakan bandar, dan memberikan rekomendasi eksekusi yang tegas. Gunakan Bahasa Indonesia yang profesional namun to-the-point."
+    sys_prompt = "Anda adalah Trader Proprietary Senior dan Analis Bandarmology di Bursa Efek Indonesia (BEI). Tugas Anda adalah mengaudit seluruh daftar hasil skrining kuantitatif, membedah narasi di balik angka, mendeteksi potensi jebakan, dan memilih saham paling superior. Gunakan Bahasa Indonesia yang profesional, tegas, dan to-the-point."
     
     data_str = ""
     for s in stocks_data:
-        # Pre-compute complex expressions to avoid f-string parsing issues and KeyErrors
+        # Pre-compute complex expressions to avoid f-string parsing issues
         tape_sigs = s.get('_tape', {}).get('signals', [])
-        tape_str = ", ".join([sig[2] for sig in tape_sigs]) if tape_sigs else 'Tidak ada'
+        tape_str = ", ".join([sig[2] for sig in tape_sigs]) if tape_sigs else 'None'
         
         dom = s.get('_bandar', {}).get('dominant')
-        bandar_str = f"{dom['label']} ({dom['conf']})" if dom else 'Tidak ada sinyal bandar'
+        bandar_str = f"{dom['label']} ({dom['conf']})" if dom else 'None'
         
         adx_dir = 'Bullish' if s.get('ADX Bullish') else 'Bearish'
         vol_ctx = s.get('_vol_ctx', {})
@@ -691,43 +691,34 @@ def analyze_with_glm(api_key, stocks_data):
         rating_str = s.get('Sistem Rating', 'N/A')
         
         tp1_str = f"{fmt_num(s['TP1'])} ({s['Upside TP1']})"
-        tp2_str = f"{fmt_num(s['TP2'])} ({s['Upside TP2']})"
-        tp3_str = f"{fmt_num(s['TP3'])} ({s['Upside TP3']})"
         
         data_str += f"""
-        Saham: {s['Ticker']} (Rating: {rating_str}, Grade: {s['Grade']})
-        - Harga Live: {fmt_num(s['Live Price'])}, Zona Beli: {fmt_num(s['Buy Min'])}-{fmt_num(s['Buy Max'])}
-        - Target: TP1={tp1_str}, TP2={tp2_str}, TP3={tp3_str}
-        - Stop Loss: {fmt_num(s['Stop Loss'])} ({s['Risk%']}), R/R TP1: {s['R/R TP1']}
-        - Indikator: ADX={s['ADX']} ({s['ADX Strength']} {adx_dir}), RSI={s['RSI']}, CMF={s['CMF']}
-        - Volume Context: Ratio={vol_ratio}x, Candle={candle_dir}
-        - Tape Reading: {tape_str}
-        - Bandarmology: {bandar_str}
+        Saham: {s['Ticker']} (Rating: {rating_str}, Grade: {s['Grade']}) | Harga: {fmt_num(s['Live Price'])} | Zona: {fmt_num(s['Buy Min'])}-{fmt_num(s['Buy Max'])} | TP1: {tp1_str} | SL: {fmt_num(s['Stop Loss'])} | R/R: {s['R/R TP1']} | ADX: {s['ADX']} ({s['ADX Strength']} {adx_dir}) | RSI: {s['RSI']} | VolRatio: {vol_ratio}x | Tape: {tape_str} | Bandar: {bandar_str}
         """
         
     user_prompt = f"""
     Berikut adalah hasil skrining kuantitatif untuk {len(stocks_data)} saham teratas hari ini:
     {data_str}
     
-    Tolong analisa saham-saham di atas. Berikan jawaban dengan format MARKDOWN berikut:
-    1. **🏆 Verdict Utama:** Pilih 1 saham PALING layak dieksekusi hari ini dari daftar di atas (atau bilang "Skip Semua" jika semua berisiko). Jelaskan kenapa.
-    2. **🕵️ Analisa Bandar & Tape:** Baca pola volume, tape, dan bandarmology. Apakah ada indikasi akumulasi tersembunyi, atau justru jebakan distribusi (pump and dump)?
-    3. **⚠️ Risiko Tersembunyi:** Apa skenario terburik yang bisa terjadi jika kita entry saham pilihanmu tadi? (Misal: SL tersentuh karena apa?)
-    4. **🎯 Strategi Eksekusi:** Bagaimana cara melakukan scaling in/partial profit yang optimal untuk saham pilihanmu tadi?
+    Tolong analisa SEMUA saham di atas. Berikan jawaban dengan format MARKDOWN berikut:
+    1. **🏆 Top Pick Utama:** Pilih 1 saham PALING layak dieksekusi hari ini dari daftar di atas (atau bilang "Skip Semua" jika semua berisiko). Jelaskan kenapa saham tersebut terpilih dibanding yang lain.
+    2. **🕵️ Analisa Bandar & Tape Market:** Baca pola volume dan tape reading dari seluruh saham di list. Apakah market secara umum lagi fase akumulasi massal, atau ada tanda-tanda distribusi institusional?
+    3. **⚠️ Saham Berisiko (Trap):** Sebutkan saham mana saja di list yang berpotensi jadi jebakan (pump & dump, false breakout, atau buying climax) yang sebaiknya dihindari meskipun skornya bagus.
+    4. **🎯 Strategi Eksekusi Top Pick:** Berikan rencana eksekusi detail (scaling in, partial profit, kapan cut loss) untuk saham Top Pick tadi.
     """
     
     payload = {
-        "model": "glm-4-flash",
+        "model": "glm-4-flash", # Menggunakan flash untuk kecepatan, bisa diganti glm-4 untuk lebih maksimal
         "messages": [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        "temperature": 0.7,
-        "max_tokens": 1200
+        "temperature": 0.6,
+        "max_tokens": 2000 # Dinaikkan karena menganalisa banyak saham
     }
     
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
         if response.status_code == 200:
             return response.json()['choices'][0]['message']['content']
         else:
@@ -873,7 +864,7 @@ min_score = st.sidebar.slider("Min Score Threshold", 50, 85, 60, 5, help="Semaki
 st.sidebar.markdown("---")
 st.sidebar.header("🤖 AI Co-Pilot (GLM-4)")
 glm_api_key = st.sidebar.text_input("Zhipu/GLM API Key", type="password", help="Dapatkan API Key gratis di open.bigmodel.cn")
-ai_analyze_btn = st.sidebar.checkbox("Analisa 3 Saham Teratas pakai AI", value=False)
+ai_analyze_btn = st.sidebar.checkbox("Analisa Semua Hasil Skrining pakai AI", value=False)
 
 if min_px >= max_px: st.sidebar.error("⚠️ Harga Minimal harus lebih kecil dari Harga Maksimal.")
 st.sidebar.markdown("---")
@@ -966,14 +957,14 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
     else:
         st.info("ℹ️ Tidak ada saham yang lolos filter pada scan ini.")
 
-    # ── AI Co-Pilot Execution ─────────────────────────────────────────────
+    # ── AI Co-Pilot Execution (Menganalisa SEMUA Hasil Skrining) ──────────
     if ai_analyze_btn and glm_api_key and not final_df.empty:
-        with st.spinner("🤖 AI Co-Pilot (GLM-4) sedang menganalisa 3 saham teratas..."):
-            top_3_data = final_df.head(3).to_dict(orient='records')
-            ai_response = analyze_with_glm(glm_api_key, top_3_data)
+        with st.spinner(f"🤖 AI Co-Pilot (GLM-4) sedang menganalisa {len(final_df)} saham hasil skrining..."):
+            all_data = final_df.to_dict(orient='records')
+            ai_response = analyze_with_glm(glm_api_key, all_data)
             if ai_response:
                 st.markdown(f'''<div class="ai-box">
-                    <div class="ai-header">🤖 Analisa AI Co-Pilot (GLM-4)</div>
+                    <div class="ai-header">🤖 Analisa AI Co-Pilot (GLM-4) - Market Overview</div>
                     <div class="ai-content">{ai_response}</div>
                 </div>''', unsafe_allow_html=True)
             else:
