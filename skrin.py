@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener Ultra v6.1",
+    page_title="Quant Trader - IDX Screener Ultra v7.0",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -38,10 +38,7 @@ st.markdown("""
     .tp  { font-size: 1.1rem; font-weight: 700; color: #3fb950; }
     .sl  { font-size: 1.1rem; font-weight: 700; color: #f85149; }
     .ts-rule { font-size: 0.85rem; font-weight: 600; color: #db6d28; }
-    .ind-pill {
-        display:inline-block; font-size:0.7rem; font-weight:600; padding:0.1rem 0.45rem;
-        border-radius:10px; margin:0.1rem;
-    }
+    .ind-pill { display:inline-block; font-size:0.7rem; font-weight:600; padding:0.1rem 0.45rem; border-radius:10px; margin:0.1rem; }
     .ind-bull { background:rgba(63,185,80,.15);  color:#3fb950; border:1px solid rgba(63,185,80,.3); }
     .ind-bear { background:rgba(248,81,73,.15);  color:#f85149; border:1px solid rgba(248,81,73,.3); }
     .ind-neut { background:rgba(139,148,158,.12);color:#8b949e; border:1px solid rgba(139,148,158,.3);}
@@ -54,10 +51,7 @@ st.markdown("""
 
     /* Tape Reading & Bandarmology */
     .section-divider { border-top:1px solid #21262d; margin:0.5rem 0 0.4rem; }
-    .tape-pill {
-        display:inline-block; font-size:0.65rem; font-weight:700; padding:0.12rem 0.4rem;
-        border-radius:8px; margin:0.08rem 0.06rem;
-    }
+    .tape-pill { display:inline-block; font-size:0.65rem; font-weight:700; padding:0.12rem 0.4rem; border-radius:8px; margin:0.08rem 0.06rem; }
     .tape-accum   { background:rgba(63,185,80,.18);  color:#3fb950; border:1px solid rgba(63,185,80,.35); }
     .tape-distrib { background:rgba(248,81,73,.18);  color:#f85149; border:1px solid rgba(248,81,73,.35); }
     .tape-neutral { background:rgba(139,148,158,.12);color:#8b949e; border:1px solid rgba(139,148,158,.3);}
@@ -147,10 +141,8 @@ def parse_tickers_from_df(df: pd.DataFrame) -> list:
 
 @st.cache_data(show_spinner=False)
 def load_local_emiten_csv():
-    try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-    except NameError:
-        base_dir = os.getcwd()
+    try: base_dir = os.path.dirname(os.path.abspath(__file__))
+    except NameError: base_dir = os.getcwd()
     local_csv = os.path.join(base_dir, "emiten.csv")
     if os.path.exists(local_csv):
         try: return parse_tickers_from_df(pd.read_csv(local_csv))
@@ -166,11 +158,7 @@ def tickers_from_text(text: str) -> list:
 # =============================================================================
 def calculate_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
     prev_close = df['Close'].shift(1)
-    tr = pd.concat([
-        df['High'] - df['Low'],
-        (df['High'] - prev_close).abs(),
-        (df['Low']  - prev_close).abs(),
-    ], axis=1).max(axis=1)
+    tr = pd.concat([df['High'] - df['Low'], (df['High'] - prev_close).abs(), (df['Low']  - prev_close).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/window, adjust=False).mean()
 
 def calculate_cmf(df: pd.DataFrame, window: int = 20) -> pd.Series:
@@ -183,8 +171,7 @@ def calculate_cmf(df: pd.DataFrame, window: int = 20) -> pd.Series:
 
 def calculate_rsi(df: pd.DataFrame, window: int = 14) -> pd.Series:
     delta = df['Close'].diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta).clip(lower=0)
+    gain, loss = delta.clip(lower=0), (-delta).clip(lower=0)
     avg_gain = gain.ewm(alpha=1/window, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/window, adjust=False).mean()
     rsi = 100 - (100 / (1 + avg_gain / avg_loss.replace(0, 1e-10)))
@@ -192,42 +179,29 @@ def calculate_rsi(df: pd.DataFrame, window: int = 14) -> pd.Series:
 
 def calculate_bb_squeeze(df: pd.DataFrame, bb_window: int = 20, bb_std: float = 2.0, kc_mult: float = 1.5, atr_window: int = 14) -> pd.Series:
     if len(df) < bb_window: return pd.Series(False, index=df.index)
-    basis   = df['Close'].rolling(bb_window).mean()
-    bb_std_ = df['Close'].rolling(bb_window).std(ddof=1)
-    bb_upper = basis + bb_std * bb_std_
-    bb_lower = basis - bb_std * bb_std_
+    basis, bb_std_ = df['Close'].rolling(bb_window).mean(), df['Close'].rolling(bb_window).std(ddof=1)
+    bb_upper, bb_lower = basis + bb_std * bb_std_, basis - bb_std * bb_std_
     atr = calculate_atr(df, window=atr_window)
-    kc_upper = basis + kc_mult * atr
-    kc_lower = basis - kc_mult * atr
-    squeeze = (bb_upper < kc_upper) & (bb_lower > kc_lower)
-    return squeeze.fillna(False)
+    kc_upper, kc_lower = basis + kc_mult * atr, basis - kc_mult * atr
+    return ((bb_upper < kc_upper) & (bb_lower > kc_lower)).fillna(False)
 
 def calculate_adx(df: pd.DataFrame, window: int = 14) -> dict:
-    if len(df) < window + 2:
-        return {'adx': 0.0, 'di_plus': 0.0, 'di_minus': 0.0, 'bullish_dir': False, 'strength': 'weak'}
-    
+    if len(df) < window + 2: return {'adx': 0.0, 'di_plus': 0.0, 'di_minus': 0.0, 'bullish_dir': False, 'strength': 'weak'}
     high, low, close = df['High'].values, df['Low'].values, df['Close'].values
     prev_close = np.roll(close, 1); prev_close[0] = close[0]
     tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
-    
     up_move, down_move = high - np.roll(high, 1), np.roll(low, 1) - low
     up_move[0], down_move[0] = 0.0, 0.0
-    
-    dm_plus  = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    dm_minus = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    
+    dm_plus, dm_minus = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
     alpha = 1.0 / window
     atr_w = pd.Series(tr).ewm(alpha=alpha, adjust=False).mean().values
     dmp_w = pd.Series(dm_plus).ewm(alpha=alpha, adjust=False).mean().values
     dmm_w = pd.Series(dm_minus).ewm(alpha=alpha, adjust=False).mean().values
-    
     safe_atr = np.maximum(atr_w, 1e-9)
     di_plus, di_minus = 100.0 * dmp_w / safe_atr, 100.0 * dmm_w / safe_atr
-    
     safe_di_sum = np.maximum(di_plus + di_minus, 1e-9)
     dx = 100.0 * np.abs(di_plus - di_minus) / safe_di_sum
     adx_s = pd.Series(dx).ewm(alpha=alpha, adjust=False).mean().values
-    
     adx_val, dip_val, dim_val = float(adx_s[-1]), float(di_plus[-1]), float(di_minus[-1])
     strength = 'strong' if adx_val >= 25 else ('moderate' if adx_val >= 18 else 'weak')
     return {'adx': round(adx_val, 1), 'di_plus': round(dip_val, 1), 'di_minus': round(dim_val, 1), 'bullish_dir': dip_val > dim_val, 'strength': strength}
@@ -237,10 +211,8 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
     ema200, ema50, ema20 = close.ewm(span=200, adjust=False).mean(), close.ewm(span=50, adjust=False).mean(), close.ewm(span=20, adjust=False).mean()
     last_close = float(close.iloc[-1])
     ema200_available = len(close) >= 200
-    
     atr_series, cmf_series, rsi_series, sq_series, adx_data = calculate_atr(df), calculate_cmf(df), calculate_rsi(df), calculate_bb_squeeze(df), calculate_adx(df)
     atr_val = float(atr_series.iloc[-1])
-    
     return {
         'last_close': last_close, 'ema200_available': ema200_available,
         'above_ema200': last_close > float(ema200.iloc[-1]) if ema200_available else False,
@@ -263,7 +235,6 @@ def is_tradeable_stock(df: pd.DataFrame, last_close: float, interval: str) -> tu
     if len(df) < 10: return False, "data terlalu pendek"
     if (df['Volume'].tail(3) <= 0).all(): return False, "volume 0 di 3 candle terakhir"
     if df['Close'].tail(5).nunique() == 1: return False, "harga stagnan 5 candle terakhir"
-    
     try:
         last_date = df.index[-1]
         if hasattr(last_date, 'to_pydatetime'): last_date = last_date.to_pydatetime()
@@ -274,7 +245,6 @@ def is_tradeable_stock(df: pd.DataFrame, last_close: float, interval: str) -> tu
         else:
             if days_stale > 10: return False, f"data basi ({days_stale} hari)"
     except: pass
-    
     if ((df['High'].tail(10) - df['Low'].tail(10)) <= 0).sum() >= 7: return False, "OHLC tidak wajar"
     if not np.isfinite(last_close) or last_close <= 0: return False, "harga tidak valid"
     return True, ""
@@ -287,9 +257,7 @@ def analyse_volume_context(df: pd.DataFrame) -> dict:
     row = df.iloc[-1]
     o, h, l, c, vol = float(row['Open']), float(row['High']), float(row['Low']), float(row['Close']), float(row['Volume'])
     rng = h - l if h > l else 1e-9
-    body, close_pos = abs(c - o), (c - l) / rng
-    vol_ratio = vol / max(float(df['Volume'].rolling(20).mean().iloc[-1]), 1.0)
-    return {'valid': True, 'candle_dir': "doji" if abs(c-o)/rng < 0.15 else ("bullish" if c>=o else "bearish"), 'body_pct': round(abs(c-o)/rng, 3), 'close_pos': round(close_pos, 3), 'vol_ratio': round(vol_ratio, 2)}
+    return {'valid': True, 'candle_dir': "doji" if abs(c-o)/rng < 0.15 else ("bullish" if c>=o else "bearish"), 'body_pct': round(abs(c-o)/rng, 3), 'close_pos': round((c-l)/rng, 3), 'vol_ratio': round(vol / max(float(df['Volume'].rolling(20).mean().iloc[-1]), 1.0), 2)}
 
 def analyse_tape(df: pd.DataFrame, atr_val: float) -> dict:
     if len(df) < 10: return {'signals': [], 'dominant': None}
@@ -298,21 +266,13 @@ def analyse_tape(df: pd.DataFrame, atr_val: float) -> dict:
     vol_ma = float(df['Volume'].rolling(20).mean().iloc[-1])
     ranges5, avg_range5 = hi5 - lo5, float(np.mean(hi5 - lo5)) if np.mean(hi5 - lo5) > 0 else 1e-9
     signals = []
-    
     last_vol_ratio, last_range = vol5[-1] / max(vol_ma, 1.0), ranges5[-1]
     last_body, last_close_pos = abs(cl5[-1] - op5[-1]), (cl5[-1] - lo5[-1]) / max(last_range, 1e-9)
-    
-    if last_vol_ratio > 2.5 and last_body/max(last_range, 1e-9) > 0.6 and cl5[-1] > op5[-1] and last_close_pos > 0.7:
-        signals.append(('buying_climax', 'distrib', 'Buying Climax', 'BC', min(int(last_vol_ratio/3.0*100), 90)))
-    if last_vol_ratio > 2.5 and last_body/max(last_range, 1e-9) > 0.6 and cl5[-1] < op5[-1] and last_close_pos < 0.3:
-        signals.append(('selling_climax', 'accum', 'Selling Climax', 'SC', min(int(last_vol_ratio/3.0*100), 90)))
-    if last_vol_ratio > 1.8 and last_close_pos > 0.55 and abs(cl5[-1]-cl5[-2])/max(atr_val, 1e-9) < 0.5:
-        signals.append(('absorption', 'accum', 'Absorption', 'ABS', min(int(last_close_pos*last_vol_ratio/2.5*100), 85)))
-    if last_vol_ratio > 1.8 and last_range < avg_range5 * 0.6:
-        signals.append(('exhaustion', 'warn', 'Exhaustion', 'EXH', min(int((avg_range5/max(last_range, 1e-9))*20), 80)))
-    if all(v < vol_ma * 0.8 for v in vol5) and (max(cl5)-min(cl5))/max(atr_val, 1e-9) < 1.5:
-        signals.append(('accum_quiet', 'accum', 'Akumulasi Senyap', 'AQ', 72))
-        
+    if last_vol_ratio > 2.5 and last_body/max(last_range, 1e-9) > 0.6 and cl5[-1] > op5[-1] and last_close_pos > 0.7: signals.append(('buying_climax', 'distrib', 'Buying Climax', 'BC', min(int(last_vol_ratio/3.0*100), 90)))
+    if last_vol_ratio > 2.5 and last_body/max(last_range, 1e-9) > 0.6 and cl5[-1] < op5[-1] and last_close_pos < 0.3: signals.append(('selling_climax', 'accum', 'Selling Climax', 'SC', min(int(last_vol_ratio/3.0*100), 90)))
+    if last_vol_ratio > 1.8 and last_close_pos > 0.55 and abs(cl5[-1]-cl5[-2])/max(atr_val, 1e-9) < 0.5: signals.append(('absorption', 'accum', 'Absorption', 'ABS', min(int(last_close_pos*last_vol_ratio/2.5*100), 85)))
+    if last_vol_ratio > 1.8 and last_range < avg_range5 * 0.6: signals.append(('exhaustion', 'warn', 'Exhaustion', 'EXH', min(int((avg_range5/max(last_range, 1e-9))*20), 80)))
+    if all(v < vol_ma * 0.8 for v in vol5) and (max(cl5)-min(cl5))/max(atr_val, 1e-9) < 1.5: signals.append(('accum_quiet', 'accum', 'Akumulasi Senyap', 'AQ', 72))
     return {'signals': signals, 'dominant': signals[0] if signals else None}
 
 def analyse_bandarmology(df: pd.DataFrame, atr_val: float) -> dict:
@@ -320,28 +280,19 @@ def analyse_bandarmology(df: pd.DataFrame, atr_val: float) -> dict:
     vol_ma = float(df['Volume'].rolling(20).mean().iloc[-1])
     close, high_arr, low_arr, open_arr, vol_arr = df['Close'].values, df['High'].values, df['Low'].values, df['Open'].values, df['Volume'].values
     n, last = len(df), len(df) - 1
-    
     def _cp(i): return (close[i] - low_arr[i]) / max(high_arr[i] - low_arr[i], 1e-9)
     def _vr(i): return vol_arr[i] / max(vol_ma, 1.0)
     def _clbl(p): return 'high' if p>=75 else ('med' if p>=50 else 'low')
-    
     signals = []
     for i in range(max(0, n-3), n):
         if close[i] < close[i-1] and _cp(i) > 0.55 and _vr(i) > 1.4:
-            conf = int(min((_cp(i)-0.55)/0.45*50 + (_vr(i)-1.4)/1.6*50, 95))
-            signals.append({'key':'accum_signal','style':'accum','label':'Akumulasi','short':'ACCU','conf_pct':conf,'conf':_clbl(conf),'candle_idx':i}); break
+            conf = int(min((_cp(i)-0.55)/0.45*50 + (_vr(i)-1.4)/1.6*50, 95)); signals.append({'key':'accum_signal','style':'accum','label':'Akumulasi','short':'ACCU','conf_pct':conf,'conf':_clbl(conf),'candle_idx':i}); break
     for i in range(max(0, n-3), n):
         if close[i] > close[i-1] and _cp(i) < 0.45 and _vr(i) > 1.8:
-            conf = int(min((1-_cp(i)-0.55)/0.45*50 + (_vr(i)-1.8)/2.2*50, 95))
-            signals.append({'key':'distrib_signal','style':'distrib','label':'Distribusi','short':'DIST','conf_pct':conf,'conf':_clbl(conf),'candle_idx':i}); break
-
-    if np.mean(vol_arr[-5:]) > vol_ma * 1.05 and np.mean(vol_arr[-5:]) < vol_ma * 1.5 and (max(close[-5:])-min(close[-5:]))/max(atr_val, 1e-9) < 1.2:
-        signals.append({'key':'stealth_accum','style':'accum','label':'Akum. Senyap','short':'STL','conf_pct':68,'conf':'med','candle_idx':last})
-    if n >= 7 and open_arr[last] > close[-2]*1.005 and _vr(last) > 2.0 and (max(close[-7:-2])-min(close[-7:-2]))/max(atr_val, 1e-9) < 2.0:
-        signals.append({'key':'markup','style':'purple','label':'Markup Phase','short':'MRK','conf_pct':int(min(60+(_vr(last)-2.0)/3.0*35, 95)),'conf':'high','candle_idx':last})
-    if n >= 3 and close[-2] < close[-3] and (close[-1]-close[-2]) > abs(close[-2]-close[-3])*0.6 and _vr(last-1) > 1.5:
-        signals.append({'key':'shakeout','style':'warn','label':'Shakeout','short':'SKO','conf_pct':int(min(55+abs(close[-2]-close[-3])/max(atr_val, 1e-9)*8, 88)),'conf':'med','candle_idx':last})
-        
+            conf = int(min((1-_cp(i)-0.55)/0.45*50 + (_vr(i)-1.8)/2.2*50, 95)); signals.append({'key':'distrib_signal','style':'distrib','label':'Distribusi','short':'DIST','conf_pct':conf,'conf':_clbl(conf),'candle_idx':i}); break
+    if np.mean(vol_arr[-5:]) > vol_ma * 1.05 and np.mean(vol_arr[-5:]) < vol_ma * 1.5 and (max(close[-5:])-min(close[-5:]))/max(atr_val, 1e-9) < 1.2: signals.append({'key':'stealth_accum','style':'accum','label':'Akum. Senyap','short':'STL','conf_pct':68,'conf':'med','candle_idx':last})
+    if n >= 7 and open_arr[last] > close[-2]*1.005 and _vr(last) > 2.0 and (max(close[-7:-2])-min(close[-7:-2]))/max(atr_val, 1e-9) < 2.0: signals.append({'key':'markup','style':'purple','label':'Markup Phase','short':'MRK','conf_pct':int(min(60+(_vr(last)-2.0)/3.0*35, 95)),'conf':'high','candle_idx':last})
+    if n >= 3 and close[-2] < close[-3] and (close[-1]-close[-2]) > abs(close[-2]-close[-3])*0.6 and _vr(last-1) > 1.5: signals.append({'key':'shakeout','style':'warn','label':'Shakeout','short':'SKO','conf_pct':int(min(55+abs(close[-2]-close[-3])/max(atr_val, 1e-9)*8, 88)),'conf':'med','candle_idx':last})
     signals.sort(key=lambda x: x['conf_pct'], reverse=True)
     dominant = signals[0] if signals else None
     n_map = {
@@ -404,7 +355,7 @@ def compute_total_score(ind):
     return round(total, 1), {k: (round(v[0],1), v[1]) for k, v in sc.items()}
 
 # =============================================================================
-# 6. TRADING PLAN
+# 6. TRADING PLAN (OPTIMIZED: ADAPTIVE ATR & DYNAMIC RISK)
 # =============================================================================
 INTRADAY_PARAMS = {'atr_sl_mult': 1.5, 'min_rr1': 1.5, 'min_rr2': 2.5, 'min_rr3': 4.0, 'ts_rule': "Trailing 1× ATR; geser ke BEP saat TP1 hit", 'fixed_risk_pct': 3.0, 'buy_zone_atr_mult': 0.35}
 SWING_PARAMS = {'atr_sl_mult': 2.0, 'min_rr1': 2.0, 'min_rr2': 3.5, 'min_rr3': 5.5, 'ts_rule': "Set BEP saat TP1 hit; trailing 2× ATR menuju TP2", 'fixed_risk_pct': 5.0, 'buy_zone_atr_mult': 0.5}
@@ -414,8 +365,17 @@ def snap_to_tick(price, direction="floor"):
     tick = 1 if p < 200 else 2 if p < 500 else 5 if p < 2000 else 10 if p < 5000 else 25
     return int(np.ceil(p/tick)*tick) if direction == "ceil" else int(np.floor(p/tick)*tick)
 
-def build_trade_plan(last_close, atr_val, params):
-    sl_dist = max(atr_val * params['atr_sl_mult'], last_close * (params['fixed_risk_pct']/100.0)*0.5)
+def build_trade_plan(last_close, atr_val, atr_pct, params):
+    # OPTIMASI #2: Adaptive ATR Multiplier
+    # Jika very volatile (>6%), perketat SL agar lot masuk akal. Jika very tight (<2%), longgarkan SL agar tidak tersentuh noise.
+    if atr_pct > 0.06: atr_adj = 0.8
+    elif atr_pct < 0.02: atr_adj = 1.2
+    else: atr_adj = 1.0
+    
+    sl_mult = params['atr_sl_mult'] * atr_adj
+    buy_atr_mult = params['buy_zone_atr_mult'] * atr_adj
+    
+    sl_dist = max(atr_val * sl_mult, last_close * (params['fixed_risk_pct']/100.0)*0.5)
     stop_loss = snap_to_tick(last_close - sl_dist, "floor") if last_close - sl_dist > 0 else snap_to_tick(last_close*0.95, "floor")
     sl_dist_actual = max(last_close - stop_loss, sl_dist)
     
@@ -423,7 +383,7 @@ def build_trade_plan(last_close, atr_val, params):
     tp2 = snap_to_tick(last_close + sl_dist_actual * params['min_rr2'], "ceil")
     tp3 = snap_to_tick(last_close + sl_dist_actual * params['min_rr3'], "ceil")
     
-    buy_min = snap_to_tick(last_close - params['buy_zone_atr_mult'] * atr_val, "floor")
+    buy_min = snap_to_tick(last_close - buy_atr_mult * atr_val, "floor")
     buy_max = snap_to_tick(last_close, "ceil")
     
     tick = 25 if last_close >= 5000 else 10 if last_close >= 2000 else 5 if last_close >= 500 else 2 if last_close >= 200 else 1
@@ -431,7 +391,14 @@ def build_trade_plan(last_close, atr_val, params):
     if buy_max < buy_min: buy_max = buy_min
     if buy_max >= tp1: buy_max, buy_min = snap_to_tick(tp1 - tick, "floor"), min(buy_min, buy_max)
     
-    return {'stop_loss': float(stop_loss), 'tp1': float(tp1), 'tp2': float(tp2), 'tp3': float(tp3), 'buy_min': float(buy_min), 'buy_max': float(buy_max), 'sl_dist': sl_dist_actual, 'rr1': round((tp1-last_close)/sl_dist_actual, 2), 'rr2': round((tp2-last_close)/sl_dist_actual, 2), 'rr3': round((tp3-last_close)/sl_dist_actual, 2), 'ts_rule': params['ts_rule'], 'partial_plan': "TP1: exit 40% → geser SL ke BEP | TP2: exit 40% | TP3/Trail: sisa 20%"}
+    return {'stop_loss': float(stop_loss), 'tp1': float(tp1), 'tp2': float(tp2), 'tp3': float(tp3), 'buy_min': float(buy_min), 'buy_max': float(buy_max), 'sl_dist': sl_dist_actual, 'rr1': round((tp1-last_close)/sl_dist_actual, 2), 'rr2': round((tp2-last_close)/sl_dist_actual, 2), 'rr3': round((tp3-last_close)/sl_dist_actual, 2), 'ts_rule': params['ts_rule'], 'partial_plan': "TP1: exit 40% → geser SL ke BEP | TP2: exit 40% | TP3/Trail: sisa 20%", 'atr_adj': atr_adj}
+
+def get_dynamic_risk(base_risk, grade, confidence):
+    # OPTIMASI #1: Dynamic Risk Sizing
+    # Grade A & High Confidence boleh ambil risiko penuh. Grade C / Rendah dipotong drastis.
+    g_scale = {'A': 1.0, 'B': 0.75, 'C': 0.5}.get(grade, 0.5)
+    c_scale = {'Tinggi': 1.0, 'Sedang': 0.8, 'Spekulatif': 0.6, 'Rendah': 0.4}.get(confidence, 0.5)
+    return max(0.25, base_risk * g_scale * c_scale)
 
 # =============================================================================
 # 7. DOWNLOAD ENGINE
@@ -444,7 +411,6 @@ def download_ticker_chunk(tickers, period_days, interval):
         data = yf.download(" ".join(tickers), start=start_date, end=end_date, interval=interval, group_by='ticker', auto_adjust=True, progress=False, threads=True, timeout=30)
         if data.empty: raise ValueError("Empty")
         is_multi = isinstance(data.columns, pd.MultiIndex)
-        
         if len(tickers) == 1:
             if not is_multi and 'Close' in data.columns:
                 df_c = data.dropna(subset=['Close'])
@@ -519,13 +485,10 @@ def estimate_trade_probabilities(score, grade, lp, bmin, bmax, sl, tp1, tp2, tp3
     a_adj = 0.0
     if ind.get("adx_strength")=="strong": a_adj = 5 if ind.get("adx_bullish_dir") else -6
     elif ind.get("adx_strength")=="moderate": a_adj = 2 if ind.get("adx_bullish_dir") else -2
-    
     atr_pct = atr_val / max(lp, 1.0)
     vol_adj = -8 if atr_pct>0.08 else -4 if atr_pct>0.05 else 3 if 0.015<=atr_pct<=0.04 else 0
-    
     p_entry = clamp_prob(base + g_bonus + s_adj + t_adj + m_adj + v_adj + tp_adj + bd_adj + a_adj + vol_adj)
     if lp <= sl: p_entry = min(p_entry, 15.0)
-    
     rps = max(lp - sl, 1.0)
     p_tp1 = clamp_prob(p_entry + min(max(((tp1-lp)/rps-1.2)*6.0, -8.0), 10.0) - atr_pct*35.0)
     p_tp2 = clamp_prob(p_entry - 12.0 + min(max(((tp2-lp)/rps-2.0)*4.0, -10.0), 8.0) - atr_pct*45.0)
@@ -562,31 +525,19 @@ def quant_strategy_engine(all_data, config, trading_mode):
         if score < config['min_score_threshold']: skipped[t] = "score rendah"; continue
         
         grade = "A" if score >= 80 else "B" if score >= 65 else "C"
-        
-        vc = analyse_volume_context(df)
-        tape = analyse_tape(df, ind['atr_val'])
-        bandar = analyse_bandarmology(df, ind['atr_val'])
-        plan = build_trade_plan(lc, ind['atr_val'], mode_params)
+        vc, tape, bandar = analyse_volume_context(df), analyse_tape(df, ind['atr_val']), analyse_bandarmology(df, ind['atr_val'])
+        plan = build_trade_plan(lc, ind['atr_val'], ind['atr_pct'], mode_params)
         
         entry_ref, loss_ps = float(plan['buy_max']), float(plan['buy_max']) - float(plan['stop_loss'])
         if loss_ps <= 0: skipped[t] = "risk invalid"; continue
-        
-        rp_risk = config['total_capital'] * (config['capital_risk_limit_pct'] / 100.0)
-        lots = int(rp_risk / loss_ps / 100)
-        max_alloc = config['total_capital'] * (config['max_capital_allocation_pct'] / 100.0)
-        req_cap = lots * 100 * entry_ref
-        if req_cap > max_alloc:
-            lots = int(max_alloc / (100 * entry_ref))
-            req_cap = lots * 100 * entry_ref
-        if lots < 1: skipped[t] = "modal kurang"; continue
         
         results.append({
             "Ticker": t.split('.')[0], "_ticker_jk": t, "Score": score, "Grade": grade, "Last Price": int(round(lc)),
             "Buy Min": plan['buy_min'], "Buy Max": plan['buy_max'], "TP1": int(plan['tp1']), "TP2": int(plan['tp2']), "TP3": int(plan['tp3']),
             "Upside TP1": f"+{round((plan['tp1']-entry_ref)/entry_ref*100, 1)}%", "Upside TP2": f"+{round((plan['tp2']-entry_ref)/entry_ref*100, 1)}%", "Upside TP3": f"+{round((plan['tp3']-entry_ref)/entry_ref*100, 1)}%",
             "Stop Loss": int(plan['stop_loss']), "Risk%": f"-{round((entry_ref-plan['stop_loss'])/entry_ref*100, 1)}%", "R/R TP1": f"1:{plan['rr1']}", "R/R TP2": f"1:{plan['rr2']}", "R/R TP3": f"1:{plan['rr3']}",
-            "ATR": round(ind['atr_val'], 1), "RSI": round(ind['rsi_val'], 1), "CMF": round(ind['cmf_val'], 3), "ADX": ind['adx_val'], "ADX Strength": ind['adx_strength'], "ADX Bullish": ind['adx_bullish_dir'],
-            "TS Kriteria": plan['ts_rule'], "Partial Plan": plan['partial_plan'], "Lots": int(lots), "Alokasi (Rp)": req_cap,
+            "ATR": round(ind['atr_val'], 1), "ATR Adj": plan['atr_adj'], "RSI": round(ind['rsi_val'], 1), "CMF": round(ind['cmf_val'], 3), "ADX": ind['adx_val'], "ADX Strength": ind['adx_strength'], "ADX Bullish": ind['adx_bullish_dir'],
+            "TS Kriteria": plan['ts_rule'], "Partial Plan": plan['partial_plan'], "Entry Ref": entry_ref, "Loss Per Share": loss_ps,
             "_breakdown": breakdown, "_vol_ctx": vc, "_tape": tape, "_bandar": bandar, "_ind": ind
         })
         
@@ -598,8 +549,24 @@ def quant_strategy_engine(all_data, config, trading_mode):
         lp = live_prices.get(r["_ticker_jk"])
         r["Live Price"] = int(round(float(lp))) if lp and np.isfinite(float(lp)) and float(lp) > 0 else int(r["Last Price"])
         r["Live Src"] = "live" if lp else "delayed"
+        
         probs = estimate_trade_probabilities(r["Score"], r["Grade"], float(r["Live Price"]), float(r["Buy Min"]), float(r["Buy Max"]), float(r["Stop Loss"]), float(r["TP1"]), float(r["TP2"]), float(r["TP3"]), float(r["ATR"]), r["_ind"], r["_vol_ctx"], r["_tape"], r["_bandar"])
         r.update(probs)
+        
+        # HITUNG MANAJEMEN MODAL DENGAN RISIKO DINAMIS
+        dyn_risk = get_dynamic_risk(config['capital_risk_limit_pct'], r["Grade"], r["Confidence"])
+        r["Dyn Risk %"] = round(dyn_risk, 2)
+        
+        rp_risk = config['total_capital'] * (dyn_risk / 100.0)
+        lots = int(rp_risk / r["Loss Per Share"] / 100)
+        max_alloc = config['total_capital'] * (config['max_capital_allocation_pct'] / 100.0)
+        req_cap = lots * 100 * r["Entry Ref"]
+        if req_cap > max_alloc:
+            lots = int(max_alloc / (100 * r["Entry Ref"]))
+            req_cap = lots * 100 * r["Entry Ref"]
+            
+        r["Lots"] = int(lots)
+        r["Alokasi (Rp)"] = req_cap
         del r["_ticker_jk"]
         
     df_out = pd.DataFrame(results)
@@ -617,11 +584,9 @@ def _tape_pill(s, st, c): return f'<span class="tape-pill tape-{st}">{s} {c}%</s
 def _conf_badge(c): 
     cls, lbl = {'high':('conf-hi','▲ Tinggi'),'med':('conf-med','◆ Sedang'),'low':('conf-lo','● Rendah')}.get(c,('conf-lo','—'))
     return f'<span class="{cls}">{lbl}</span>'
-    
 def _adx_info(a, s, b): 
     lbl = {"strong": "Kuat", "moderate": "Sedang", "weak": "Lemah"}.get(s, "—")
     return f'<span class="adx-info">ADX {a:.0f} {"▲" if b else "▼"} {lbl}</span>'
-    
 def _grade_badge(g): return f'<span class="grade-{g}">Grade {g}</span>'
 
 def _render_volume_ctx(vc):
@@ -640,12 +605,9 @@ def _render_volume_ctx(vc):
 
 def _render_tape_bandar(tape, bandar):
     p = []
-    if tape.get('signals'):
-        p.append(f'<div style="margin-bottom:0.25rem;"><span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;margin-right:0.3rem;">Tape</span>{"".join(_tape_pill(s[3],s[1],s[4]) for s in tape["signals"][:4])}</div>')
-    if bandar.get('signals'):
-        p.append(f'<div style="display:flex;align-items:center;gap:0.3rem;flex-wrap:wrap;margin-bottom:0.25rem;"><span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;">Bandar</span>{"".join(_tape_pill(s["short"],s["style"],s["conf_pct"]) for s in bandar["signals"][:3])}{_conf_badge(bandar["dominant"]["conf"]) if bandar.get("dominant") else ""}</div>')
-    if bandar.get('narasi_tech'):
-        p.append(f'<div style="background:rgba(255,255,255,0.02);border-left:2px solid #30363d;padding:0.3rem 0.5rem;border-radius:0 4px 4px 0;"><div class="narasi-tech">"{bandar["narasi_tech"]}"</div><div class="narasi-plain">→ {bandar["narasi_plain"]}</div></div>')
+    if tape.get('signals'): p.append(f'<div style="margin-bottom:0.25rem;"><span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;margin-right:0.3rem;">Tape</span>{"".join(_tape_pill(s[3],s[1],s[4]) for s in tape["signals"][:4])}</div>')
+    if bandar.get('signals'): p.append(f'<div style="display:flex;align-items:center;gap:0.3rem;flex-wrap:wrap;margin-bottom:0.25rem;"><span style="font-size:0.6rem;color:#8b949e;text-transform:uppercase;">Bandar</span>{"".join(_tape_pill(s["short"],s["style"],s["conf_pct"]) for s in bandar["signals"][:3])}{_conf_badge(bandar["dominant"]["conf"]) if bandar.get("dominant") else ""}</div>')
+    if bandar.get('narasi_tech'): p.append(f'<div style="background:rgba(255,255,255,0.02);border-left:2px solid #30363d;padding:0.3rem 0.5rem;border-radius:0 4px 4px 0;"><div class="narasi-tech">"{bandar["narasi_tech"]}"</div><div class="narasi-plain">→ {bandar["narasi_plain"]}</div></div>')
     return f'<div class="section-divider"></div><div style="margin-bottom:0.4rem;">{"".join(p)}</div>' if p else ''
 
 def _price_status(lp, rc, bmin, bmax, src):
@@ -673,20 +635,19 @@ def compute_best_buy_score(row):
         else: total += 10; r.append("⏳ Di bawah zona, SL masih aman")
     else: return 0.0, []
     
+    if row.get("Lots", 0) < 1: return 0.0, ["Modal tidak cukup untuk risiko minimum"]
+    
     total += (row["Score"]/100.0)*25; r.append(f"📊 Score teknikal {row['Score']}")
     total += {"A":10,"B":6,"C":2}.get(row.get("Grade","C"), 2); r.append(f"🏅 Grade {row.get('Grade','C')}")
-    
     dom = row.get("_bandar", {}).get("dominant")
     if dom:
         cp = {"high":15,"med":8,"low":3}.get(dom.get("conf","low"),3)
         if dom.get("style") == "distrib": total -= cp; r.append(f"⚠️ Sinyal distribusi ({dom.get('conf','')})")
         else: total += cp; r.append(f"🔍 Bandar: {dom.get('label','')} ({dom.get('conf','')})")
     else: r.append("— Tidak ada sinyal bandar")
-    
     ts = row.get("_tape", {}).get("signals", [])
-    if [s for s in ts if s[1] == "accum"]: total += 10; r.append(f"📼 Tape: Akumulasi")
+    if [s for s in ts if s[1] == "accum"]: total += 10; r.append("📼 Tape: Akumulasi")
     elif any(s[1] == "distrib" for s in ts): total -= 5; r.append("📼 Tape: Distribusi")
-    
     vc = row.get("_vol_ctx", {})
     if vc.get("valid"):
         vo, bo = vc.get("vol_ratio",0) >= 1.3, vc.get("candle_dir") == "bullish"
@@ -779,7 +740,7 @@ def render_trade_cards(df, max_cards=6, best_ticker=None):
                     <div style="margin-bottom:0.4rem;background:rgba(255,255,255,0.02);border-radius:6px;padding:0.3rem 0.5rem;border:1px solid #21262d;">
                         <div class="label" style="margin-bottom:0.15rem;">Rencana Partial Exit</div><div style="font-size:0.68rem;color:#c9d1d9;">{row["Partial Plan"]}</div></div>
                     <div style="border-top:1px solid #30363d;padding-top:0.4rem;display:grid;grid-template-columns:1fr 1fr;gap:0.3rem;font-size:0.75rem;">
-                        <div><div class="label">Lots Berbasis Risiko</div><div style="color:#fff;font-weight:600">{int(row["Lots"])} Lot</div></div>
+                        <div><div class="label">Lots (Risk {row["Dyn Risk %"]}% · ATR {row["ATR Adj"]}x)</div><div style="color:#fff;font-weight:600">{int(row["Lots"])} Lot</div></div>
                         <div><div class="label">Maks Alokasi</div><div style="color:#58a6ff;font-weight:600">{fmt_idr(row["Alokasi (Rp)"])}</div></div></div>{dc}{th}</div>''', unsafe_allow_html=True)
 
 # =============================================================================
@@ -787,7 +748,7 @@ def render_trade_cards(df, max_cards=6, best_ticker=None):
 # =============================================================================
 st.sidebar.header("⚙️ Parameter Algoritma")
 capital = st.sidebar.number_input("Total Modal Akun (Rp)", value=50_000_000, step=5_000_000, min_value=1_000_000)
-risk_limit = st.sidebar.slider("Maks Risiko per Trade (%)", 0.5, 5.0, 2.0, 0.5)
+risk_limit = st.sidebar.slider("Base Risk per Trade (%)", 0.5, 5.0, 2.0, 0.5, help="Risiko maksimum. Sistem akan memotong risiko ini secara dinamis untuk saham Grade B/C.")
 allocation_limit = st.sidebar.slider("Maks Alokasi Dana per Saham (%)", 10, 50, 25, 5)
 
 st.sidebar.markdown("---")
@@ -921,9 +882,10 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
                 "Zona Beli": f"Rp {fmt_num(row['Buy Min'])} – {fmt_num(row['Buy Max'])}", "Target 1": f"Rp {fmt_num(row['TP1'])} ({row['Upside TP1']})",
                 "Target 2": f"Rp {fmt_num(row['TP2'])} ({row['Upside TP2']})", "Target 3": f"Rp {fmt_num(row['TP3'])} ({row['Upside TP3']})",
                 "Stop Loss": f"Rp {fmt_num(row['Stop Loss'])} ({row['Risk%']})", "R/R": row["R/R TP1"], "Score": row["Score"], "Grade": row["Grade"],
-                "ADX": _al(row), "Prob Entry": f"{row['Prob Entry']}%", "Prob TP1": f"{row['Prob TP1']}%", "Prob SL": f"{row['Prob SL']}%",
+                "ADX": _al(row), "Risk Dyn": f"{row['Dyn Risk %']}%", "Lots": f"{int(row['Lots'])} lot",
+                "Prob Entry": f"{row['Prob Entry']}%", "Prob TP1": f"{row['Prob TP1']}%", "Prob SL": f"{row['Prob SL']}%",
                 "Confidence": row["Confidence"], "Status": _vl(row), "Sinyal Bandar": _bl(row), "Tape": _tl(row),
-                "Lot Saran": f"{int(row['Lots'])} lot", "Alokasi": fmt_idr(row["Alokasi (Rp)"])
+                "Alokasi": fmt_idr(row["Alokasi (Rp)"])
             })
 
         tabel_df = pd.DataFrame(tabel_rows)
