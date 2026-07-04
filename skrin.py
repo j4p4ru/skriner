@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener AI v9.4 (Free-Tier Optimized)",
+    page_title="Quant Trader - IDX Screener AI Universal v10.0",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -99,11 +99,11 @@ st.markdown("""
         padding:0.7rem 1rem; margin-bottom:1.2rem;
     }
     .ai-box {
-        background: linear-gradient(135deg, rgba(66, 133, 244, 0.08) 0%, #161b22 60%);
-        border: 1px solid rgba(66, 133, 244, 0.4); border-radius: 8px;
+        background: linear-gradient(135deg, rgba(136, 132, 216, 0.08) 0%, #161b22 60%);
+        border: 1px solid rgba(136, 132, 216, 0.4); border-radius: 8px;
         padding: 1.2rem; margin-top: 1rem; color: #e6edf3;
     }
-    .ai-header { font-size: 1.1rem; font-weight: 800; color: #4285F4; margin-bottom: 0.5rem; border-bottom: 1px solid rgba(66, 133, 244, 0.3); padding-bottom: 0.5rem; }
+    .ai-header { font-size: 1.1rem; font-weight: 800; color: #8884d8; margin-bottom: 0.5rem; border-bottom: 1px solid rgba(136, 132, 216, 0.3); padding-bottom: 0.5rem; }
     .ai-content { font-size: 0.88rem; line-height: 1.6; white-space: pre-wrap; }
 </style>
 """, unsafe_allow_html=True)
@@ -664,43 +664,93 @@ def _price_status(lp, rc, bmin, bmax, src):
         <div style="text-align:right;"><div style="font-size:0.65rem;color:{sc};font-weight:700;">{sl}</div><div style="font-size:0.65rem;color:{c};font-weight:600;">{i} {l}</div></div></div>'''
 
 # =============================================================================
-# 11. AI INTEGRATION (GEMINI FREE-TIER OPTIMIZED)
+# 11. UNIVERSAL AI INTEGRATION (AUTO-DETECT API)
 # =============================================================================
 def get_best_gemini_model(api_key):
-    """Auto-detect model AI Gemini terbaik untuk Free Tier (Prioritaskan Flash)."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
     try:
         res = requests.get(url, timeout=15)
         if res.status_code == 200:
             models = res.json().get("models", [])
-            
-            # Prioritas 1: Gemini 1.5 Flash (Batas Free Tier 1500 request/hari)
             for m in models:
                 name = m.get("name", "").replace("models/", "")
                 if "generateContent" in m.get("supportedGenerationMethods", []):
                     if "gemini-1.5-flash" in name: return name
-            
-            # Prioritas 2: Gemini 1.0 Pro / Gemini Pro
             for m in models:
                 name = m.get("name", "").replace("models/", "")
                 if "generateContent" in m.get("supportedGenerationMethods", []):
                     if "gemini-pro" in name: return name
-                    
-            # Prioritas 3: Gemini 1.5 Pro (Batas Free Tier hanya 50 request/hari)
             for m in models:
                 name = m.get("name", "").replace("models/", "")
                 if "generateContent" in m.get("supportedGenerationMethods", []):
                     if "gemini-1.5-pro" in name: return name
     except:
         pass
-    return "gemini-1.5-flash" # Fallback teraman
+    return "gemini-1.5-flash"
 
-def analyze_with_gemini(api_key, stocks_data):
-    if not api_key or not stocks_data: return None
-    
+def call_gemini(api_key, sys_prompt, user_prompt):
     model_name = get_best_gemini_model(api_key)
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
+    payload = {
+        "system_instruction": {"parts": [{"text": sys_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {"temperature": 0.6, "maxOutputTokens": 2000}
+    }
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    if res.status_code == 200: return res.json()['candidates'][0]['content']['parts'][0]['text']
+    return f"Error Gemini: {res.status_code} - {res.text}"
+
+def call_openai(api_key, sys_prompt, user_prompt):
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": "gpt-4o-mini", 
+        "messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+        "temperature": 0.6, "max_tokens": 2000
+    }
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    if res.status_code == 200: return res.json()['choices'][0]['message']['content']
+    return f"Error OpenAI: {res.status_code} - {res.text}"
+
+def call_claude(api_key, sys_prompt, user_prompt):
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    payload = {
+        "model": "claude-3-haiku-20240307", 
+        "max_tokens": 2000, "system": sys_prompt,
+        "messages": [{"role": "user", "content": user_prompt}]
+    }
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    if res.status_code == 200: return res.json()['content'][0]['text']
+    return f"Error Claude: {res.status_code} - {res.text}"
+
+def call_groq(api_key, sys_prompt, user_prompt):
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": "llama-3.1-8b-instant", 
+        "messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+        "temperature": 0.6, "max_tokens": 2000
+    }
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    if res.status_code == 200: return res.json()['choices'][0]['message']['content']
+    return f"Error Groq: {res.status_code} - {res.text}"
+
+def call_glm(api_key, sys_prompt, user_prompt):
+    url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": "glm-4-flash", 
+        "messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
+        "temperature": 0.6, "max_tokens": 2000
+    }
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    if res.status_code == 200: return res.json()['choices'][0]['message']['content']
+    return f"Error GLM: {res.status_code} - {res.text}"
+
+def analyze_with_auto_ai(api_key, stocks_data):
+    if not api_key or not stocks_data: return None
     
     sys_prompt = "Anda adalah Trader Proprietary Senior dan Analis Bandarmology di Bursa Efek Indonesia (BEI). Tugas Anda adalah mengaudit seluruh daftar hasil skrining kuantitatif, membedah narasi di balik angka, mendeteksi potensi jebakan, dan memilih saham paling superior. Gunakan Bahasa Indonesia yang profesional, tegas, dan to-the-point."
     
@@ -708,21 +758,15 @@ def analyze_with_gemini(api_key, stocks_data):
     for s in stocks_data:
         tape_sigs = s.get('_tape', {}).get('signals', [])
         tape_str = ", ".join([sig[2] for sig in tape_sigs]) if tape_sigs else 'None'
-        
         dom = s.get('_bandar', {}).get('dominant')
         bandar_str = f"{dom['label']} ({dom['conf']})" if dom else 'None'
-        
         adx_dir = 'Bullish' if s.get('ADX Bullish') else 'Bearish'
         vol_ctx = s.get('_vol_ctx', {})
         vol_ratio = vol_ctx.get('vol_ratio', 0)
-        candle_dir = vol_ctx.get('candle_dir', 'N/A')
-        
         rating_str = s.get('Sistem Rating', 'N/A')
         tp1_str = f"{fmt_num(s['TP1'])} ({s['Upside TP1']})"
         
-        data_str += f"""
-        Saham: {s['Ticker']} (Rating: {rating_str}, Grade: {s['Grade']}) | Harga: {fmt_num(s['Live Price'])} | Zona: {fmt_num(s['Buy Min'])}-{fmt_num(s['Buy Max'])} | TP1: {tp1_str} | SL: {fmt_num(s['Stop Loss'])} | R/R: {s['R/R TP1']} | ADX: {s['ADX']} ({s['ADX Strength']} {adx_dir}) | RSI: {s['RSI']} | VolRatio: {vol_ratio}x | Tape: {tape_str} | Bandar: {bandar_str}
-        """
+        data_str += f"Saham: {s['Ticker']} (Rating: {rating_str}, Grade: {s['Grade']}) | Harga: {fmt_num(s['Live Price'])} | Zona: {fmt_num(s['Buy Min'])}-{fmt_num(s['Buy Max'])} | TP1: {tp1_str} | SL: {fmt_num(s['Stop Loss'])} | R/R: {s['R/R TP1']} | ADX: {s['ADX']} ({s['ADX Strength']} {adx_dir}) | RSI: {s['RSI']} | VolRatio: {vol_ratio}x | Tape: {tape_str} | Bandar: {bandar_str}\n"
         
     user_prompt = f"""
     Berikut adalah hasil skrining kuantitatif untuk {len(stocks_data)} saham teratas hari ini:
@@ -735,32 +779,17 @@ def analyze_with_gemini(api_key, stocks_data):
     4. **🎯 Strategi Eksekusi Top Pick:** Berikan rencana eksekusi detail (scaling in, partial profit, kapan cut loss) untuk saham Top Pick tadi.
     """
     
-    payload = {
-        "system_instruction": {
-            "parts": [{"text": sys_prompt}]
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": user_prompt}]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.6,
-            "maxOutputTokens": 2000
-        }
-    }
-    
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
-        if response.status_code == 200:
-            return response.json()['candidates'][0]['content']['parts'][0]['text']
-        elif response.status_code == 429:
-            return "⚠️ **Kuota Harian AI Habis (429 RESOURCE_EXHAUSTED)**\n\nGoogle membatasi jumlah request gratis per hari (terutama untuk model Pro). Jika Anda sudah mencapai batas ini, Anda bisa:\n1. Tunggu hingga besok hari (quota akan reset otomatis).\n2. Upgrade ke plan berbayar Google Cloud Vertex AI.\n3. Gunakan API AI lain (seperti Zhipu/GLM atau OpenAI)."
-        else:
-            return f"Error API Gemini: {response.status_code} - {response.text}"
-    except Exception as e:
-        return f"Gagal konek ke API Gemini: {e}"
+    # --- AUTO DETECT PROVIDER ---
+    if api_key.startswith("AIza"):
+        return call_gemini(api_key, sys_prompt, user_prompt)
+    elif api_key.startswith("sk-ant"):
+        return call_claude(api_key, sys_prompt, user_prompt)
+    elif api_key.startswith("sk-"):
+        return call_openai(api_key, sys_prompt, user_prompt)
+    elif api_key.startswith("gsk_"):
+        return call_groq(api_key, sys_prompt, user_prompt)
+    else:
+        return call_glm(api_key, sys_prompt, user_prompt)
 
 # =============================================================================
 # 12. BEST BUY ENGINE
@@ -898,8 +927,8 @@ max_px = st.sidebar.number_input("Harga Maksimal Saham (Rp)", value=25_000, step
 min_score = st.sidebar.slider("Min Score Threshold", 50, 85, 60, 5, help="Semakin tinggi = sinyal lebih selektif")
 
 st.sidebar.markdown("---")
-st.sidebar.header("🤖 AI Co-Pilot (Gemini)")
-gemini_api_key = st.sidebar.text_input("Google Gemini API Key", type="password", help="Dapatkan API Key gratis di aistudio.google.com/app/apikey. Sistem otomatis pakai model 'Flash' agar kuota tidak cepat habis.")
+st.sidebar.header("🤖 Universal AI Co-Pilot")
+ai_api_key = st.sidebar.text_input("Masukkan API Key (OpenAI/Claude/Gemini/Groq/GLM)", type="password", help="Sistem akan otomatis mendeteksi provider AI berdasarkan awalan key (sk-, sk-ant-, AIza, gsk_, dll).")
 ai_analyze_btn = st.sidebar.checkbox("Analisa Semua Hasil Skrining pakai AI", value=False)
 
 if min_px >= max_px: st.sidebar.error("⚠️ Harga Minimal harus lebih kecil dari Harga Maksimal.")
@@ -993,20 +1022,20 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
     else:
         st.info("ℹ️ Tidak ada saham yang lolos filter pada scan ini.")
 
-    # ── AI Co-Pilot Execution ──────────────────────────────────────────
-    if ai_analyze_btn and gemini_api_key and not final_df.empty:
-        with st.spinner(f"🤖 AI Co-Pilot (Gemini) sedang menganalisa {len(final_df)} saham hasil skrining..."):
+    # ── Universal AI Co-Pilot Execution ──────────────────────────────────
+    if ai_analyze_btn and ai_api_key and not final_df.empty:
+        with st.spinner(f"🤖 Universal AI sedang auto-detect & menganalisa {len(final_df)} saham..."):
             all_data = final_df.to_dict(orient='records')
-            ai_response = analyze_with_gemini(gemini_api_key, all_data)
+            ai_response = analyze_with_auto_ai(ai_api_key, all_data)
             if ai_response:
                 st.markdown(f'''<div class="ai-box">
-                    <div class="ai-header">🤖 Analisa AI Co-Pilot (Gemini) - Market Overview</div>
+                    <div class="ai-header">🤖 Analisa AI Co-Pilot - Market Overview</div>
                     <div class="ai-content">{ai_response}</div>
                 </div>''', unsafe_allow_html=True)
             else:
                 st.error("Gagal mendapatkan respons dari AI.")
-    elif ai_analyze_btn and not gemini_api_key:
-        st.warning("⚠️ Masukkan Google Gemini API Key di sidebar untuk mengaktifkan AI.")
+    elif ai_analyze_btn and not ai_api_key:
+        st.warning("⚠️ Masukkan API Key AI apapun di sidebar untuk mengaktifkan AI.")
     # ──────────────────────────────────────────────────────────────────────
 
     render_trade_cards(final_df, max_cards=6, best_ticker=best_ticker)
