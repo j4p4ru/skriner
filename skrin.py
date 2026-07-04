@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener AI (Gemini) v9.2",
+    page_title="Quant Trader - IDX Screener AI v9.3 (Auto-Detect)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -664,13 +664,40 @@ def _price_status(lp, rc, bmin, bmax, src):
         <div style="text-align:right;"><div style="font-size:0.65rem;color:{sc};font-weight:700;">{sl}</div><div style="font-size:0.65rem;color:{c};font-weight:600;">{i} {l}</div></div></div>'''
 
 # =============================================================================
-# 11. AI INTEGRATION (GEMINI 1.5 FLASH CO-PILOT)
+# 11. AI INTEGRATION (GEMINI AUTO-DETECT MODEL)
 # =============================================================================
+def get_best_gemini_model(api_key):
+    """Auto-detect model AI Gemini terbaik yang tersedia di API Key pengguna."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        res = requests.get(url, timeout=15)
+        if res.status_code == 200:
+            models = res.json().get("models", [])
+            # Prioritas: 1.5-pro > 1.5-flash > 1.0-pro
+            for m in models:
+                name = m.get("name", "").replace("models/", "")
+                if "generateContent" in m.get("supportedGenerationMethods", []):
+                    if "gemini-1.5-pro" in name: return name
+            for m in models:
+                name = m.get("name", "").replace("models/", "")
+                if "generateContent" in m.get("supportedGenerationMethods", []):
+                    if "gemini-1.5-flash" in name: return name
+            for m in models:
+                name = m.get("name", "").replace("models/", "")
+                if "generateContent" in m.get("supportedGenerationMethods", []):
+                    if "gemini-pro" in name: return name
+    except:
+        pass
+    return "gemini-pro" # Fallback
+
 def analyze_with_gemini(api_key, stocks_data):
     if not api_key or not stocks_data: return None
     
-    # FIX: Menggunakan model 'gemini-1.5-flash-latest' agar tidak 404 NOT_FOUND
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
+    # 1. Auto-Detect Model
+    model_name = get_best_gemini_model(api_key)
+    
+    # 2. Bangun URL dengan model yang terdeteksi
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
     
     sys_prompt = "Anda adalah Trader Proprietary Senior dan Analis Bandarmology di Bursa Efek Indonesia (BEI). Tugas Anda adalah mengaudit seluruh daftar hasil skrining kuantitatif, membedah narasi di balik angka, mendeteksi potensi jebakan, dan memilih saham paling superior. Gunakan Bahasa Indonesia yang profesional, tegas, dan to-the-point."
@@ -867,8 +894,8 @@ max_px = st.sidebar.number_input("Harga Maksimal Saham (Rp)", value=25_000, step
 min_score = st.sidebar.slider("Min Score Threshold", 50, 85, 60, 5, help="Semakin tinggi = sinyal lebih selektif")
 
 st.sidebar.markdown("---")
-st.sidebar.header("🤖 AI Co-Pilot (Gemini)")
-gemini_api_key = st.sidebar.text_input("Google Gemini API Key", type="password", help="Dapatkan API Key gratis di aistudio.google.com/app/apikey")
+st.sidebar.header("🤖 AI Co-Pilot (Gemini Auto-Detect)")
+gemini_api_key = st.sidebar.text_input("Google Gemini API Key", type="password", help="Dapatkan API Key gratis di aistudio.google.com/app/apikey. Sistem akan otomatis mendeteksi model terbaik yang tersedia.")
 ai_analyze_btn = st.sidebar.checkbox("Analisa Semua Hasil Skrining pakai AI", value=False)
 
 if min_px >= max_px: st.sidebar.error("⚠️ Harga Minimal harus lebih kecil dari Harga Maksimal.")
@@ -962,9 +989,9 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
     else:
         st.info("ℹ️ Tidak ada saham yang lolos filter pada scan ini.")
 
-    # ── AI Co-Pilot Execution (Gemini 1.5 Flash Latest) ──────────────────
+    # ── AI Co-Pilot Execution (Gemini Auto-Detect) ──────────────────────
     if ai_analyze_btn and gemini_api_key and not final_df.empty:
-        with st.spinner(f"🤖 AI Co-Pilot (Gemini 1.5 Flash) sedang menganalisa {len(final_df)} saham hasil skrining..."):
+        with st.spinner(f"🤖 AI Co-Pilot (Gemini) sedang auto-detect model & menganalisa {len(final_df)} saham..."):
             all_data = final_df.to_dict(orient='records')
             ai_response = analyze_with_gemini(gemini_api_key, all_data)
             if ai_response:
