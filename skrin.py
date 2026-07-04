@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener AI v8.1",
+    page_title="Quant Trader - IDX Screener AI v8.2",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -676,24 +676,26 @@ def analyze_with_glm(api_key, stocks_data):
     
     data_str = ""
     for s in stocks_data:
-        # Pre-compute complex expressions to avoid f-string parsing issues in Python < 3.12
+        # Pre-compute complex expressions to avoid f-string parsing issues and KeyErrors
         tape_sigs = s.get('_tape', {}).get('signals', [])
         tape_str = ", ".join([sig[2] for sig in tape_sigs]) if tape_sigs else 'Tidak ada'
         
         dom = s.get('_bandar', {}).get('dominant')
         bandar_str = f"{dom['label']} ({dom['conf']})" if dom else 'Tidak ada sinyal bandar'
         
-        adx_dir = 'Bullish' if s['ADX Bullish'] else 'Bearish'
+        adx_dir = 'Bullish' if s.get('ADX Bullish') else 'Bearish'
         vol_ctx = s.get('_vol_ctx', {})
         vol_ratio = vol_ctx.get('vol_ratio', 0)
         candle_dir = vol_ctx.get('candle_dir', 'N/A')
+        
+        rating_str = s.get('Sistem Rating', 'N/A')
         
         tp1_str = f"{fmt_num(s['TP1'])} ({s['Upside TP1']})"
         tp2_str = f"{fmt_num(s['TP2'])} ({s['Upside TP2']})"
         tp3_str = f"{fmt_num(s['TP3'])} ({s['Upside TP3']})"
         
         data_str += f"""
-        Saham: {s['Ticker']} (Rating: {s['Rating']}, Grade: {s['Grade']})
+        Saham: {s['Ticker']} (Rating: {rating_str}, Grade: {s['Grade']})
         - Harga Live: {fmt_num(s['Live Price'])}, Zona Beli: {fmt_num(s['Buy Min'])}-{fmt_num(s['Buy Max'])}
         - Target: TP1={tp1_str}, TP2={tp2_str}, TP3={tp3_str}
         - Stop Loss: {fmt_num(s['Stop Loss'])} ({s['Risk%']}), R/R TP1: {s['R/R TP1']}
