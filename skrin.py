@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener Ultra v7.0",
+    page_title="Quant Trader - IDX Screener Ultra v7.1",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -102,10 +102,7 @@ st.markdown("""
         border:1px solid rgba(88,166,255,0.3); border-radius:8px;
         padding:0.7rem 1rem; margin-bottom:1.2rem;
     }
-    .summary-card {
-        background-color: #161b22; border: 1px solid #30363d; border-radius: 8px;
-        padding: 1rem; text-align: center;
-    }
+    .summary-card { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; text-align: center; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -355,7 +352,7 @@ def compute_total_score(ind):
     return round(total, 1), {k: (round(v[0],1), v[1]) for k, v in sc.items()}
 
 # =============================================================================
-# 6. TRADING PLAN (OPTIMIZED: ADAPTIVE ATR & DYNAMIC RISK)
+# 6. TRADING PLAN
 # =============================================================================
 INTRADAY_PARAMS = {'atr_sl_mult': 1.5, 'min_rr1': 1.5, 'min_rr2': 2.5, 'min_rr3': 4.0, 'ts_rule': "Trailing 1× ATR; geser ke BEP saat TP1 hit", 'fixed_risk_pct': 3.0, 'buy_zone_atr_mult': 0.35}
 SWING_PARAMS = {'atr_sl_mult': 2.0, 'min_rr1': 2.0, 'min_rr2': 3.5, 'min_rr3': 5.5, 'ts_rule': "Set BEP saat TP1 hit; trailing 2× ATR menuju TP2", 'fixed_risk_pct': 5.0, 'buy_zone_atr_mult': 0.5}
@@ -366,36 +363,26 @@ def snap_to_tick(price, direction="floor"):
     return int(np.ceil(p/tick)*tick) if direction == "ceil" else int(np.floor(p/tick)*tick)
 
 def build_trade_plan(last_close, atr_val, atr_pct, params):
-    # OPTIMASI #2: Adaptive ATR Multiplier
-    # Jika very volatile (>6%), perketat SL agar lot masuk akal. Jika very tight (<2%), longgarkan SL agar tidak tersentuh noise.
     if atr_pct > 0.06: atr_adj = 0.8
     elif atr_pct < 0.02: atr_adj = 1.2
     else: atr_adj = 1.0
-    
     sl_mult = params['atr_sl_mult'] * atr_adj
     buy_atr_mult = params['buy_zone_atr_mult'] * atr_adj
-    
     sl_dist = max(atr_val * sl_mult, last_close * (params['fixed_risk_pct']/100.0)*0.5)
     stop_loss = snap_to_tick(last_close - sl_dist, "floor") if last_close - sl_dist > 0 else snap_to_tick(last_close*0.95, "floor")
     sl_dist_actual = max(last_close - stop_loss, sl_dist)
-    
     tp1 = snap_to_tick(last_close + sl_dist_actual * params['min_rr1'], "ceil")
     tp2 = snap_to_tick(last_close + sl_dist_actual * params['min_rr2'], "ceil")
     tp3 = snap_to_tick(last_close + sl_dist_actual * params['min_rr3'], "ceil")
-    
     buy_min = snap_to_tick(last_close - buy_atr_mult * atr_val, "floor")
     buy_max = snap_to_tick(last_close, "ceil")
-    
     tick = 25 if last_close >= 5000 else 10 if last_close >= 2000 else 5 if last_close >= 500 else 2 if last_close >= 200 else 1
     if buy_min <= stop_loss: buy_min = stop_loss + tick
     if buy_max < buy_min: buy_max = buy_min
     if buy_max >= tp1: buy_max, buy_min = snap_to_tick(tp1 - tick, "floor"), min(buy_min, buy_max)
-    
     return {'stop_loss': float(stop_loss), 'tp1': float(tp1), 'tp2': float(tp2), 'tp3': float(tp3), 'buy_min': float(buy_min), 'buy_max': float(buy_max), 'sl_dist': sl_dist_actual, 'rr1': round((tp1-last_close)/sl_dist_actual, 2), 'rr2': round((tp2-last_close)/sl_dist_actual, 2), 'rr3': round((tp3-last_close)/sl_dist_actual, 2), 'ts_rule': params['ts_rule'], 'partial_plan': "TP1: exit 40% → geser SL ke BEP | TP2: exit 40% | TP3/Trail: sisa 20%", 'atr_adj': atr_adj}
 
 def get_dynamic_risk(base_risk, grade, confidence):
-    # OPTIMASI #1: Dynamic Risk Sizing
-    # Grade A & High Confidence boleh ambil risiko penuh. Grade C / Rendah dipotong drastis.
     g_scale = {'A': 1.0, 'B': 0.75, 'C': 0.5}.get(grade, 0.5)
     c_scale = {'Tinggi': 1.0, 'Sedang': 0.8, 'Spekulatif': 0.6, 'Rendah': 0.4}.get(confidence, 0.5)
     return max(0.25, base_risk * g_scale * c_scale)
@@ -497,7 +484,7 @@ def estimate_trade_probabilities(score, grade, lp, bmin, bmax, sl, tp1, tp2, tp3
     return {"Prob Entry": p_entry, "Prob TP1": p_tp1, "Prob TP2": p_tp2, "Prob TP3": p_tp3, "Prob SL": p_sl, "Confidence": probability_label(p_entry)}
 
 # =============================================================================
-# 9. MAIN STRATEGY ENGINE
+# 9. MAIN STRATEGY ENGINE & ACTIONABILITY RANKING
 # =============================================================================
 def quant_strategy_engine(all_data, config, trading_mode):
     mode_params = INTRADAY_PARAMS if trading_mode == "Intraday (Fast Trade)" else SWING_PARAMS
@@ -537,7 +524,7 @@ def quant_strategy_engine(all_data, config, trading_mode):
             "Upside TP1": f"+{round((plan['tp1']-entry_ref)/entry_ref*100, 1)}%", "Upside TP2": f"+{round((plan['tp2']-entry_ref)/entry_ref*100, 1)}%", "Upside TP3": f"+{round((plan['tp3']-entry_ref)/entry_ref*100, 1)}%",
             "Stop Loss": int(plan['stop_loss']), "Risk%": f"-{round((entry_ref-plan['stop_loss'])/entry_ref*100, 1)}%", "R/R TP1": f"1:{plan['rr1']}", "R/R TP2": f"1:{plan['rr2']}", "R/R TP3": f"1:{plan['rr3']}",
             "ATR": round(ind['atr_val'], 1), "ATR Adj": plan['atr_adj'], "RSI": round(ind['rsi_val'], 1), "CMF": round(ind['cmf_val'], 3), "ADX": ind['adx_val'], "ADX Strength": ind['adx_strength'], "ADX Bullish": ind['adx_bullish_dir'],
-            "TS Kriteria": plan['ts_rule'], "Partial Plan": plan['partial_plan'], "Entry Ref": entry_ref, "Loss Per Share": loss_ps,
+            "TS Kriteria": plan['ts_rule'], "Partial Plan": plan['partial_plan'], "Entry Ref": entry_ref, "Loss Per Share": loss_ps, "Rr1_Raw": plan['rr1'],
             "_breakdown": breakdown, "_vol_ctx": vc, "_tape": tape, "_bandar": bandar, "_ind": ind
         })
         
@@ -553,10 +540,8 @@ def quant_strategy_engine(all_data, config, trading_mode):
         probs = estimate_trade_probabilities(r["Score"], r["Grade"], float(r["Live Price"]), float(r["Buy Min"]), float(r["Buy Max"]), float(r["Stop Loss"]), float(r["TP1"]), float(r["TP2"]), float(r["TP3"]), float(r["ATR"]), r["_ind"], r["_vol_ctx"], r["_tape"], r["_bandar"])
         r.update(probs)
         
-        # HITUNG MANAJEMEN MODAL DENGAN RISIKO DINAMIS
         dyn_risk = get_dynamic_risk(config['capital_risk_limit_pct'], r["Grade"], r["Confidence"])
         r["Dyn Risk %"] = round(dyn_risk, 2)
-        
         rp_risk = config['total_capital'] * (dyn_risk / 100.0)
         lots = int(rp_risk / r["Loss Per Share"] / 100)
         max_alloc = config['total_capital'] * (config['max_capital_allocation_pct'] / 100.0)
@@ -564,17 +549,69 @@ def quant_strategy_engine(all_data, config, trading_mode):
         if req_cap > max_alloc:
             lots = int(max_alloc / (100 * r["Entry Ref"]))
             req_cap = lots * 100 * r["Entry Ref"]
-            
         r["Lots"] = int(lots)
         r["Alokasi (Rp)"] = req_cap
         del r["_ticker_jk"]
         
     df_out = pd.DataFrame(results)
-    def _vr(row): 
-        lp, sl, bmin, bmax = row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"]
-        return 2 if lp <= sl else 1 if (lp < bmin or lp > bmax) else 0
-    df_out["_vr"] = df_out.apply(_vr, axis=1)
-    return df_out.sort_values(by=["_vr", "Prob Entry", "Score"], ascending=[True, False, False]).drop(columns=["_vr"]).reset_index(drop=True)
+    
+    # =====================================================================
+    # ACTIONABILITY RANKING ENGINE (SKRIP SORTIR CERDAS)
+    # =====================================================================
+    def _calculate_action_rank(row):
+        v = _check_signal_validity(row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"])
+        rank = 0.0
+        
+        # 1. Validitas (Paling Penting)
+        if v['status'] == 'valid': rank += 1000
+        elif v['status'] == 'waiting': rank += 500
+        else: return -1000  # Expired langsung dasar
+            
+        # 2. R/R Ratio (Makin besar makin baik)
+        rank += row["Rr1_Raw"] * 50
+        
+        # 3. Smart Money (Bandar)
+        dom = row.get("_bandar", {}).get("dominant")
+        if dom:
+            if dom.get("style") == "accum":
+                rank += {"high": 150, "med": 100, "low": 50}.get(dom.get("conf"), 0)
+            elif dom.get("style") == "distrib":
+                rank -= {"high": 150, "med": 100, "low": 50}.get(dom.get("conf"), 0)
+                
+        # 4. Tape Reading
+        for sig in row.get("_tape", {}).get("signals", []):
+            if sig[1] == "accum": rank += 80
+            elif sig[1] == "distrib": rank -= 80
+            elif sig[1] == "warn": rank -= 40
+                
+        # 5. ADX (Kekuatan Tren)
+        if row.get("ADX Strength") == "strong":
+            rank += 80 if row.get("ADX Bullish") else -80
+        elif row.get("ADX Strength") == "moderate":
+            rank += 40 if row.get("ADX Bullish") else -40
+            
+        # 6. Probabilitas Spread
+        rank += (row["Prob Entry"] - row["Prob SL"]) * 2
+        
+        # 7. Tie-breaker: Score Teknikal
+        rank += row["Score"]
+        
+        return rank
+
+    df_out["_action_rank"] = df_out.apply(_calculate_action_rank, axis=1)
+    
+    # Generate Sistem Rating Bintang
+    def _gen_stars(row):
+        r = row["_action_rank"]
+        if r >= 1300: return "⭐⭐⭐⭐⭐"
+        if r >= 1100: return "⭐⭐⭐⭐"
+        if r >= 900:  return "⭐⭐⭐"
+        if r >= 700:  return "⭐⭐"
+        return "⭐"
+        
+    df_out["Sistem Rating"] = df_out.apply(_gen_stars, axis=1)
+    
+    return df_out.sort_values(by="_action_rank", ascending=False).drop(columns=["_action_rank"]).reset_index(drop=True)
 
 # =============================================================================
 # 10. RENDER HELPERS
@@ -634,9 +671,7 @@ def compute_best_buy_score(row):
         if row["Live Price"] > row["Buy Max"]: total += 4; r.append("⏳ Di atas zona, tunggu pullback")
         else: total += 10; r.append("⏳ Di bawah zona, SL masih aman")
     else: return 0.0, []
-    
     if row.get("Lots", 0) < 1: return 0.0, ["Modal tidak cukup untuk risiko minimum"]
-    
     total += (row["Score"]/100.0)*25; r.append(f"📊 Score teknikal {row['Score']}")
     total += {"A":10,"B":6,"C":2}.get(row.get("Grade","C"), 2); r.append(f"🏅 Grade {row.get('Grade','C')}")
     dom = row.get("_bandar", {}).get("dominant")
@@ -855,7 +890,7 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
     if not final_df.empty:
         st.markdown("---")
         st.markdown("### 📋 Ringkasan Semua Hasil Skrining")
-        st.caption("Semua saham yang lolos filter, diurutkan dari yang paling direkomendasikan.")
+        st.caption("Saham diurutkan berdasarkan Sistem Rating (Actionability Rank) yang memperhitungkan Validitas, R/R, Bandar, ADX, dan Probabilitas.")
 
         def _vl(row): 
             v = _check_signal_validity(row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"])
@@ -878,7 +913,9 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
         tabel_rows = []
         for _, row in final_df.iterrows():
             tabel_rows.append({
-                "🏆": "👑" if row["Ticker"] == best_ticker else "", "Saham": row["Ticker"], "Harga Skrg": f"Rp {fmt_num(row['Live Price'])}",
+                "Rating": row["Sistem Rating"],
+                "🏆": "👑" if row["Ticker"] == best_ticker else "", 
+                "Saham": row["Ticker"], "Harga Skrg": f"Rp {fmt_num(row['Live Price'])}",
                 "Zona Beli": f"Rp {fmt_num(row['Buy Min'])} – {fmt_num(row['Buy Max'])}", "Target 1": f"Rp {fmt_num(row['TP1'])} ({row['Upside TP1']})",
                 "Target 2": f"Rp {fmt_num(row['TP2'])} ({row['Upside TP2']})", "Target 3": f"Rp {fmt_num(row['TP3'])} ({row['Upside TP3']})",
                 "Stop Loss": f"Rp {fmt_num(row['Stop Loss'])} ({row['Risk%']})", "R/R": row["R/R TP1"], "Score": row["Score"], "Grade": row["Grade"],
