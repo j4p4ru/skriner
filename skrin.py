@@ -4,6 +4,8 @@ import numpy as np
 import yfinance as yf
 import re
 import os
+import json
+import requests
 import concurrent.futures
 from datetime import datetime, timedelta
 
@@ -11,7 +13,7 @@ from datetime import datetime, timedelta
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener Ultra v7.2",
+    page_title="Quant Trader - IDX Screener AI v8.0",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -96,6 +98,13 @@ st.markdown("""
         border:1px solid rgba(88,166,255,0.3); border-radius:8px;
         padding:0.7rem 1rem; margin-bottom:1.2rem;
     }
+    .ai-box {
+        background: linear-gradient(135deg, rgba(188,140,255,0.08) 0%, #161b22 60%);
+        border: 1px solid rgba(188,140,255,0.4); border-radius: 8px;
+        padding: 1.2rem; margin-top: 1rem; color: #e6edf3;
+    }
+    .ai-header { font-size: 1.1rem; font-weight: 800; color: #bc8cff; margin-bottom: 0.5rem; border-bottom: 1px solid rgba(188,140,255,0.3); padding-bottom: 0.5rem; }
+    .ai-content { font-size: 0.88rem; line-height: 1.6; white-space: pre-wrap; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -345,7 +354,7 @@ def compute_total_score(ind):
     return round(total, 1), {k: (round(v[0],1), v[1]) for k, v in sc.items()}
 
 # =============================================================================
-# 6. TRADING PLAN (OPTIMIZED v7.2: MIDPOINT & BREAKOUT BUFFER)
+# 6. TRADING PLAN
 # =============================================================================
 INTRADAY_PARAMS = {'atr_sl_mult': 1.5, 'min_rr1': 1.5, 'min_rr2': 2.5, 'min_rr3': 4.0, 'ts_rule': "Trailing 1× ATR; geser ke BEP saat TP1 hit", 'fixed_risk_pct': 3.0, 'buy_zone_atr_mult': 0.35}
 SWING_PARAMS = {'atr_sl_mult': 2.0, 'min_rr1': 2.0, 'min_rr2': 3.5, 'min_rr3': 5.5, 'ts_rule': "Set BEP saat TP1 hit; trailing 2× ATR menuju TP2", 'fixed_risk_pct': 5.0, 'buy_zone_atr_mult': 0.5}
@@ -356,33 +365,22 @@ def snap_to_tick(price, direction="floor"):
     return int(np.ceil(p/tick)*tick) if direction == "ceil" else int(np.floor(p/tick)*tick)
 
 def build_trade_plan(last_close, atr_val, atr_pct, params):
-    # Adaptive ATR
     if atr_pct > 0.06: atr_adj = 0.8
     elif atr_pct < 0.02: atr_adj = 1.2
     else: atr_adj = 1.0
-    
     sl_mult = params['atr_sl_mult'] * atr_adj
     buy_atr_mult = params['buy_zone_atr_mult'] * atr_adj
-    
-    # 1. Breakout Buffer: Tambah 0.1x ATR di atas close agar tidak miss breakout
     buy_max_raw = last_close + (0.1 * atr_val)
     buy_min_raw = last_close - (buy_atr_mult * atr_val)
-    
     buy_max = snap_to_tick(buy_max_raw, "ceil")
     buy_min = snap_to_tick(buy_min_raw, "floor")
-    
-    # 2. Hitung Entry Ref berdasarkan Midpoint
     entry_ref = (buy_max + buy_min) / 2.0
-    
-    # 3. Stop Loss & TP berbasis Midpoint
     sl_dist = max(atr_val * sl_mult, entry_ref * (params['fixed_risk_pct']/100.0)*0.5)
     stop_loss = snap_to_tick(entry_ref - sl_dist, "floor") if entry_ref - sl_dist > 0 else snap_to_tick(entry_ref*0.95, "floor")
     sl_dist_actual = max(entry_ref - stop_loss, sl_dist)
-    
     tp1 = snap_to_tick(entry_ref + sl_dist_actual * params['min_rr1'], "ceil")
     tp2 = snap_to_tick(entry_ref + sl_dist_actual * params['min_rr2'], "ceil")
     tp3 = snap_to_tick(entry_ref + sl_dist_actual * params['min_rr3'], "ceil")
-    
     tick = 25 if last_close >= 5000 else 10 if last_close >= 2000 else 5 if last_close >= 500 else 2 if last_close >= 200 else 1
     if buy_min <= stop_loss:
         buy_min = stop_loss + tick
@@ -393,7 +391,6 @@ def build_trade_plan(last_close, atr_val, atr_pct, params):
     if buy_max >= tp1:
         buy_max = snap_to_tick(tp1 - tick, "floor")
         entry_ref = (buy_max + buy_min) / 2.0
-        
     return {
         'stop_loss': float(stop_loss), 'tp1': float(tp1), 'tp2': float(tp2), 'tp3': float(tp3), 
         'buy_min': float(buy_min), 'buy_max': float(buy_max), 'entry_ref': float(entry_ref),
@@ -661,7 +658,61 @@ def _price_status(lp, rc, bmin, bmax, src):
         <div style="text-align:right;"><div style="font-size:0.65rem;color:{sc};font-weight:700;">{sl}</div><div style="font-size:0.65rem;color:{c};font-weight:600;">{i} {l}</div></div></div>'''
 
 # =============================================================================
-# 11. BEST BUY ENGINE
+# 11. AI INTEGRATION (GLM-4 CO-PILOT)
+# =============================================================================
+def analyze_with_glm(api_key, stocks_data):
+    if not api_key or not stocks_data: return None
+    
+    url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    
+    sys_prompt = "Anda adalah Trader Proprietary Senior dan Analis Bandarmology di Bursa Efek Indonesia (BEI). Tugas Anda adalah menganalisa data kuantitatif yang diberikan, menemukan narasi tersembunyi di balik angka tersebut, mendeteksi potensi jebakan bandar, dan memberikan rekomendasi eksekusi yang tegas. Gunakan Bahasa Indonesia yang profesional namun to-the-point."
+    
+    data_str = ""
+    for s in stocks_data:
+        data_str += f"""
+        Saham: {s['Ticker']} (Rating: {s['Rating']}, Grade: {s['Grade']})
+        - Harga Live: {fmt_num(s['Live Price'])}, Zona Beli: {fmt_num(s['Buy Min'])}-{fmt_num(s['Buy Max'])}
+        - Target: TP1={fmt_num(s['TP1'])} ({s['Upside TP1']}), TP2={fmt_num(s['TP2'])} ({s['Upside TP2']}), TP3={fmt_num(s['TP3'])} ({s['Upside TP3'])})
+        - Stop Loss: {fmt_num(s['Stop Loss'])} ({s['Risk%']}), R/R TP1: {s['R/R TP1']}
+        - Indikator: ADX={s['ADX']} ({s['ADX Strength']} {'Bullish' if s['ADX Bullish'] else 'Bearish'}), RSI={s['RSI']}, CMF={s['CMF']}
+        - Volume Context: Ratio={s['_vol_ctx']['vol_ratio']}x, Candle={s['_vol_ctx']['candle_dir']}
+        - Tape Reading: {", ".join([sig[2] for sig in s['_tape']['signals']]) if s['_tape']['signals'] else 'Tidak ada'}
+        - Bandarmology: {s['_bandar']['dominant']['label'] + ' (' + s['_bandar']['dominant']['conf'] + ')' if s['_bandar'].get('dominant') else 'Tidak ada sinyal bandar'}
+        """
+        
+    user_prompt = f"""
+    Berikut adalah hasil skrining kuantitatif untuk {len(stocks_data)} saham teratas hari ini:
+    {data_str}
+    
+    Tolong analisa saham-saham di atas. Berikan jawaban dengan format MARKDOWN berikut:
+    1. **🏆 Verdict Utama:** Pilih 1 saham PALING layak dieksekusi hari ini dari daftar di atas (atau bilang "Skip Semua" jika semua berisiko). Jelaskan kenapa.
+    2. **🕵️ Analisa Bandar & Tape:** Baca pola volume, tape, dan bandarmology. Apakah ada indikasi akumulasi tersembunyi, atau justru jebakan distribusi (pump and dump)?
+    3. **⚠️ Risiko Tersembunyi:** Apa skenario terburik yang bisa terjadi jika kita entry saham pilihanmu tadi? (Misal: SL tersentuh karena apa?)
+    4. **🎯 Strategi Eksekusi:** Bagaimana cara melakukan scaling in/partial profit yang optimal untuk saham pilihanmu tadi?
+    """
+    
+    payload = {
+        "model": "glm-4-flash", # Menggunakan flash untuk kecepatan, bisa diganti glm-4 untuk lebih maksimal
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1200
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            return response.json()['choices'][0]['message']['content']
+        else:
+            return f"Error API GLM: {response.status_code} - {response.text}"
+    except Exception as e:
+        return f"Gagal konek ke API GLM: {e}"
+
+# =============================================================================
+# 12. BEST BUY ENGINE
 # =============================================================================
 MIN_BEST_BUY_SCORE = 45.0
 
@@ -729,7 +780,7 @@ def render_no_best_buy_notice():
     <div style="font-size:0.78rem;color:#8b949e;margin-top:0.3rem;">Tidak ada saham memenuhi standar "Best Buy" (karena harga chasing atau score lemah). Cek tabel di bawah untuk kandidat "Tunggu Dulu".</div></div>''', unsafe_allow_html=True)
 
 # =============================================================================
-# 12. RENDER TRADE CARDS
+# 13. RENDER TRADE CARDS
 # =============================================================================
 def render_trade_cards(df, max_cards=6, best_ticker=None):
     if df.empty: st.info("ℹ️ Tidak ada saham yang memenuhi kriteria atau alokasi modal tidak cukup."); return
@@ -781,7 +832,7 @@ def render_trade_cards(df, max_cards=6, best_ticker=None):
                         <div><div class="label">Maks Alokasi</div><div style="color:#58a6ff;font-weight:600">{fmt_idr(row["Alokasi (Rp)"])}</div></div></div>{dc}{th}</div>''', unsafe_allow_html=True)
 
 # =============================================================================
-# 13. SIDEBAR & MAIN UI
+# 14. SIDEBAR & MAIN UI
 # =============================================================================
 st.sidebar.header("⚙️ Parameter Algoritma")
 capital = st.sidebar.number_input("Total Modal Akun (Rp)", value=50_000_000, step=5_000_000, min_value=1_000_000)
@@ -794,6 +845,11 @@ min_adtv_value = st.sidebar.number_input("Minimal ADTV (Rp)", value=500_000_000,
 min_px = st.sidebar.number_input("Harga Minimal Saham (Rp)", value=100, step=50, min_value=1)
 max_px = st.sidebar.number_input("Harga Maksimal Saham (Rp)", value=25_000, step=500, min_value=1)
 min_score = st.sidebar.slider("Min Score Threshold", 50, 85, 60, 5, help="Semakin tinggi = sinyal lebih selektif")
+
+st.sidebar.markdown("---")
+st.sidebar.header("🤖 AI Co-Pilot (GLM-4)")
+glm_api_key = st.sidebar.text_input("Zhipu/GLM API Key", type="password", help="Dapatkan API Key gratis di open.bigmodel.cn")
+ai_analyze_btn = st.sidebar.checkbox("Analisa 3 Saham Teratas pakai AI", value=False)
 
 if min_px >= max_px: st.sidebar.error("⚠️ Harga Minimal harus lebih kecil dari Harga Maksimal.")
 st.sidebar.markdown("---")
@@ -837,7 +893,7 @@ with btn_col2:
         st.success("Reset berhasil.")
 
 # =============================================================================
-# 14. EXECUTION CORE
+# 15. EXECUTION CORE
 # =============================================================================
 if execute_scan:
     if not tickers_ready: st.error("❌ Daftar emiten kosong."); st.stop()
@@ -885,6 +941,22 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
         render_no_best_buy_notice()
     else:
         st.info("ℹ️ Tidak ada saham yang lolos filter pada scan ini.")
+
+    # ── AI Co-Pilot Execution ─────────────────────────────────────────────
+    if ai_analyze_btn and glm_api_key and not final_df.empty:
+        with st.spinner("🤖 AI Co-Pilot (GLM-4) sedang menganalisa 3 saham teratas..."):
+            top_3_data = final_df.head(3).to_dict(orient='records')
+            ai_response = analyze_with_glm(glm_api_key, top_3_data)
+            if ai_response:
+                st.markdown(f'''<div class="ai-box">
+                    <div class="ai-header">🤖 Analisa AI Co-Pilot (GLM-4)</div>
+                    <div class="ai-content">{ai_response}</div>
+                </div>''', unsafe_allow_html=True)
+            else:
+                st.error("Gagal mendapatkan respons dari AI.")
+    elif ai_analyze_btn and not glm_api_key:
+        st.warning("⚠️ Masukkan Zhipu/GLM API Key di sidebar untuk mengaktifkan AI.")
+    # ──────────────────────────────────────────────────────────────────────
 
     render_trade_cards(final_df, max_cards=6, best_ticker=best_ticker)
 
