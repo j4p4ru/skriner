@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener AI v8.4",
+    page_title="Quant Trader - IDX Screener AI (Claude) v9.0",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -99,11 +99,11 @@ st.markdown("""
         padding:0.7rem 1rem; margin-bottom:1.2rem;
     }
     .ai-box {
-        background: linear-gradient(135deg, rgba(188,140,255,0.08) 0%, #161b22 60%);
-        border: 1px solid rgba(188,140,255,0.4); border-radius: 8px;
+        background: linear-gradient(135deg, rgba(217, 119, 87, 0.08) 0%, #161b22 60%);
+        border: 1px solid rgba(217, 119, 87, 0.4); border-radius: 8px;
         padding: 1.2rem; margin-top: 1rem; color: #e6edf3;
     }
-    .ai-header { font-size: 1.1rem; font-weight: 800; color: #bc8cff; margin-bottom: 0.5rem; border-bottom: 1px solid rgba(188,140,255,0.3); padding-bottom: 0.5rem; }
+    .ai-header { font-size: 1.1rem; font-weight: 800; color: #d97757; margin-bottom: 0.5rem; border-bottom: 1px solid rgba(217, 119, 87, 0.3); padding-bottom: 0.5rem; }
     .ai-content { font-size: 0.88rem; line-height: 1.6; white-space: pre-wrap; }
 </style>
 """, unsafe_allow_html=True)
@@ -664,19 +664,22 @@ def _price_status(lp, rc, bmin, bmax, src):
         <div style="text-align:right;"><div style="font-size:0.65rem;color:{sc};font-weight:700;">{sl}</div><div style="font-size:0.65rem;color:{c};font-weight:600;">{i} {l}</div></div></div>'''
 
 # =============================================================================
-# 11. AI INTEGRATION (GLM-4 CO-PILOT - ANALISA SEMUA SAHAM)
+# 11. AI INTEGRATION (CLAUDE 3.5 SONNET CO-PILOT)
 # =============================================================================
-def analyze_with_glm(api_key, stocks_data):
+def analyze_with_claude(api_key, stocks_data):
     if not api_key or not stocks_data: return None
     
-    url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
     
     sys_prompt = "Anda adalah Trader Proprietary Senior dan Analis Bandarmology di Bursa Efek Indonesia (BEI). Tugas Anda adalah mengaudit seluruh daftar hasil skrining kuantitatif, membedah narasi di balik angka, mendeteksi potensi jebakan, dan memilih saham paling superior. Gunakan Bahasa Indonesia yang profesional, tegas, dan to-the-point."
     
     data_str = ""
     for s in stocks_data:
-        # Pre-compute complex expressions to avoid f-string parsing issues
         tape_sigs = s.get('_tape', {}).get('signals', [])
         tape_str = ", ".join([sig[2] for sig in tape_sigs]) if tape_sigs else 'None'
         
@@ -689,7 +692,6 @@ def analyze_with_glm(api_key, stocks_data):
         candle_dir = vol_ctx.get('candle_dir', 'N/A')
         
         rating_str = s.get('Sistem Rating', 'N/A')
-        
         tp1_str = f"{fmt_num(s['TP1'])} ({s['Upside TP1']})"
         
         data_str += f"""
@@ -708,23 +710,23 @@ def analyze_with_glm(api_key, stocks_data):
     """
     
     payload = {
-        "model": "glm-4",  # FIX: Ganti dari glm-4-flash ke glm-4
+        "model": "claude-3-5-sonnet-20241022", # Model terpintar Anthropic
+        "max_tokens": 2000,
+        "system": sys_prompt,
         "messages": [
-            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt}
-        ],
-        "temperature": 0.6,
-        "max_tokens": 2000 # Dinaikkan karena menganalisa banyak saham
+        ]
     }
     
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=60)
         if response.status_code == 200:
-            return response.json()['choices'][0]['message']['content']
+            # Parsing respons Claude
+            return response.json()['content'][0]['text']
         else:
-            return f"Error API GLM: {response.status_code} - {response.text}"
+            return f"Error API Claude: {response.status_code} - {response.text}"
     except Exception as e:
-        return f"Gagal konek ke API GLM: {e}"
+        return f"Gagal konek ke API Claude: {e}"
 
 # =============================================================================
 # 12. BEST BUY ENGINE
@@ -862,8 +864,8 @@ max_px = st.sidebar.number_input("Harga Maksimal Saham (Rp)", value=25_000, step
 min_score = st.sidebar.slider("Min Score Threshold", 50, 85, 60, 5, help="Semakin tinggi = sinyal lebih selektif")
 
 st.sidebar.markdown("---")
-st.sidebar.header("🤖 AI Co-Pilot (GLM-4)")
-glm_api_key = st.sidebar.text_input("Zhipu/GLM API Key", type="password", help="Dapatkan API Key gratis di open.bigmodel.cn")
+st.sidebar.header("🤖 AI Co-Pilot (Claude)")
+claude_api_key = st.sidebar.text_input("Anthropic / Claude API Key", type="password", help="Dapatkan API Key di console.anthropic.com")
 ai_analyze_btn = st.sidebar.checkbox("Analisa Semua Hasil Skrining pakai AI", value=False)
 
 if min_px >= max_px: st.sidebar.error("⚠️ Harga Minimal harus lebih kecil dari Harga Maksimal.")
@@ -957,20 +959,20 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
     else:
         st.info("ℹ️ Tidak ada saham yang lolos filter pada scan ini.")
 
-    # ── AI Co-Pilot Execution (Menganalisa SEMUA Hasil Skrining) ──────────
-    if ai_analyze_btn and glm_api_key and not final_df.empty:
-        with st.spinner(f"🤖 AI Co-Pilot (GLM-4) sedang menganalisa {len(final_df)} saham hasil skrining..."):
+    # ── AI Co-Pilot Execution (Claude 3.5 Sonnet) ──────────────────────
+    if ai_analyze_btn and claude_api_key and not final_df.empty:
+        with st.spinner(f"🤖 AI Co-Pilot (Claude 3.5 Sonnet) sedang menganalisa {len(final_df)} saham hasil skrining..."):
             all_data = final_df.to_dict(orient='records')
-            ai_response = analyze_with_glm(glm_api_key, all_data)
+            ai_response = analyze_with_claude(claude_api_key, all_data)
             if ai_response:
                 st.markdown(f'''<div class="ai-box">
-                    <div class="ai-header">🤖 Analisa AI Co-Pilot (GLM-4) - Market Overview</div>
+                    <div class="ai-header">🤖 Analisa AI Co-Pilot (Claude) - Market Overview</div>
                     <div class="ai-content">{ai_response}</div>
                 </div>''', unsafe_allow_html=True)
             else:
                 st.error("Gagal mendapatkan respons dari AI.")
-    elif ai_analyze_btn and not glm_api_key:
-        st.warning("⚠️ Masukkan Zhipu/GLM API Key di sidebar untuk mengaktifkan AI.")
+    elif ai_analyze_btn and not claude_api_key:
+        st.warning("⚠️ Masukkan Anthropic / Claude API Key di sidebar untuk mengaktifkan AI.")
     # ──────────────────────────────────────────────────────────────────────
 
     render_trade_cards(final_df, max_cards=6, best_ticker=best_ticker)
