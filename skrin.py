@@ -2124,32 +2124,72 @@ trading_mode = st.radio(
 )
 
 st.markdown("### 📋 Daftar Saham")
-input_tab, upload_tab = st.tabs(["✏️ Input Manual", "📂 Upload CSV"])
-tickers_ready = ["BBRI.JK", "BBCA.JK", "BMRI.JK", "TLKM.JK", "ASII.JK"]
 
-with input_tab:
-    ticker_text = st.text_area("Kode Saham (pisah koma/spasi):", value="BBRI, BBCA, BMRI, TLKM, ASII", height=100)
-    if ticker_text.strip():
-        tickers_ready = tickers_from_text(ticker_text)
+# =============================================================================
+# ROMBAK INTERFACE — Sumber data ticker (dilaporkan bug: input manual tidak
+# "merespons", tetap men-scan semua saham)
+# =============================================================================
+# AKAR MASALAH (versi lama): tab "Input Manual" dan "Upload CSV" SAMA-SAMA
+# selalu dieksekusi setiap rerun (Streamlit tidak "mematikan" kode tab yang
+# sedang tidak terlihat), lalu ada blok tambahan:
+#     if uploaded_csv is None:
+#         local_tickers = load_local_emiten_csv()
+#         if local_tickers: tickers_ready = local_tickers
+# Blok ini jalan setiap kali TIDAK ADA file di-upload — yaitu kondisi NORMAL
+# saat memakai tab Input Manual. Kalau ada file emiten.csv di folder yang
+# sama dengan script, isinya diam-diam MENIMPA apa pun yang diketik manual,
+# tanpa pemberitahuan apa pun. Itulah sebabnya input terasa "tidak
+# merespons" dan hasil scan selalu mencakup seluruh watchlist.
+#
+# FIX: sumber data sekarang dipilih eksplisit lewat radio (mutually
+# exclusive, tidak ada lagi override diam-diam), dan HASIL PILIHAN selalu
+# ditampilkan langsung (jumlah + daftar saham) sebelum tombol scan ditekan,
+# supaya selalu ada "respons" visual yang jelas.
+local_tickers_available = load_local_emiten_csv()
 
-uploaded_csv = None
-with upload_tab:
+source_options = ["✏️ Input Manual", "📂 Upload CSV"]
+if local_tickers_available:
+    source_options.append(f"📋 Watchlist Tersimpan ({len(local_tickers_available)} saham)")
+
+source_mode = st.radio("Sumber Data Saham:", source_options, horizontal=True)
+
+tickers_ready = []
+
+if source_mode == "✏️ Input Manual":
+    ticker_text = st.text_area(
+        "Kode Saham (pisah koma / spasi / baris baru):",
+        value="BBRI, BBCA, BMRI, TLKM, ASII",
+        height=100,
+        help="Contoh: BBRI, BBCA, BMRI — akhiran .JK opsional, otomatis ditambahkan.",
+    )
+    tickers_ready = tickers_from_text(ticker_text) if ticker_text.strip() else []
+
+elif source_mode == "📂 Upload CSV":
     uploaded_csv = st.file_uploader("Upload CSV emiten:", type=["csv"])
     if uploaded_csv is not None:
         try:
             t_csv = parse_tickers_from_df(pd.read_csv(uploaded_csv))
             if t_csv:
                 tickers_ready = t_csv
-                st.success(f"✅ {len(tickers_ready)} saham dimuat.")
             else:
-                st.warning("⚠️ Tidak ada ticker valid dalam CSV.")
+                st.warning("⚠️ Tidak ada ticker valid ditemukan dalam kolom CSV.")
         except Exception as e:
-            st.error(f"Error CSV: {e}")
+            st.error(f"❌ Error membaca CSV: {e}")
+    else:
+        st.info("📂 Silakan upload file CSV berisi kolom ticker/kode saham.")
 
-if uploaded_csv is None:
-    local_tickers = load_local_emiten_csv()
-    if local_tickers:
-        tickers_ready = local_tickers
+else:  # Watchlist Tersimpan (emiten.csv lokal) — sekarang pilihan EKSPLISIT
+    tickers_ready = local_tickers_available
+
+# ── Preview langsung: konfirmasi visual apa yang AKAN di-scan ───────────────
+if tickers_ready:
+    preview_names = [t.replace(".JK", "") for t in tickers_ready[:15]]
+    preview_str   = ", ".join(preview_names)
+    if len(tickers_ready) > 15:
+        preview_str += f" … (+{len(tickers_ready) - 15} lagi)"
+    st.markdown(f"✅ **{len(tickers_ready)} saham siap di-scan:** {preview_str}")
+else:
+    st.warning("⚠️ Belum ada saham terpilih — lengkapi input di atas sebelum menjalankan scan.")
 
 st.markdown("---")
 btn_col1, btn_col2 = st.columns([1, 4])
