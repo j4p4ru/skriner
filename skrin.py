@@ -119,7 +119,7 @@ from functools import lru_cache
 # 1. KONFIGURASI HALAMAN & CSS
 # =============================================================================
 st.set_page_config(
-    page_title="Quant Trader - IDX Screener Ultra v6.1",
+    page_title="Quant Trader - IDX Screener Ultra v7.0",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -239,6 +239,8 @@ st.markdown("""
 for key, default in [
     ('raw_market_data', {}), ('last_loaded_mode', None), ('scan_meta', {}),
     ('download_failures', {}),
+    ('last_final_df', None),
+    ('ihsg_data', None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -643,8 +645,107 @@ def analyse_tape(df: pd.DataFrame) -> dict:
 
 
 # =============================================================================
-# 4d. BANDARMOLOGY — deteksi aksi smart money
+# 4d0. PATTERN DETEKSI TAMBAHAN — fitur baru (Divergence + Bull Trap)
 # =============================================================================
+def _find_pivots(series: pd.Series, order: int = 3) -> tuple[list, list]:
+    """
+    Deteksi pivot low & pivot high sederhana TANPA dependency tambahan
+    (tidak pakai scipy) — titik ke-i adalah pivot low kalau dia yang
+    PALING RENDAH dalam jendela simetris [i-order, i+order], sebaliknya
+    untuk pivot high.
+    """
+    vals = series.values
+    n = len(vals)
+    pivot_lows, pivot_highs = [], []
+    for i in range(order, n - order):
+        window = vals[i - order:i + order + 1]
+        if vals[i] == window.min() and np.argmin(window) == order:
+            pivot_lows.append(i)
+        if vals[i] == window.max() and np.argmax(window) == order:
+            pivot_highs.append(i)
+    return pivot_lows, pivot_highs
+
+
+def _detect_divergence(df: pd.DataFrame, indicator_series: pd.Series, indicator_name: str,
+                        lookback: int = 40, order: int = 3) -> dict | None:
+    """
+    Bandingkan 2 pivot low (atau high) TERAKHIR dalam window lookback:
+    - Bullish divergence: harga bikin LOWER LOW, indikator bikin HIGHER LOW
+      (momentum jual sebenarnya melemah walau harga masih turun — sinyal
+      reversal naik klasik).
+    - Bearish divergence: harga bikin HIGHER HIGH, indikator bikin LOWER
+      HIGH (momentum beli melemah walau harga masih naik — sinyal
+      reversal turun / distribusi).
+    """
+    if len(df) < lookback + order * 2:
+        return None
+
+    tail_close = df['Close'].tail(lookback).reset_index(drop=True)
+    tail_ind   = indicator_series.tail(lookback).reset_index(drop=True)
+    if tail_ind.isna().any():
+        return None
+
+    price_lows, price_highs = _find_pivots(tail_close, order)
+
+    if len(price_lows) >= 2:
+        i1, i2 = price_lows[-2], price_lows[-1]
+        if tail_close[i2] < tail_close[i1] and tail_ind[i2] > tail_ind[i1]:
+            gap = abs(float(tail_ind[i2]) - float(tail_ind[i1]))
+            conf = min(int(gap * 3 + 55), 88)
+            return {
+                'key': f'bullish_div_{indicator_name}', 'style': 'accum',
+                'label': f'Bullish Divergence ({indicator_name.upper()})',
+                'short': f'DIV+{indicator_name[:3].upper()}', 'conf_pct': conf,
+                'conf': 'high' if conf >= 75 else 'med', 'candle_idx': len(df) - 1,
+            }
+
+    if len(price_highs) >= 2:
+        i1, i2 = price_highs[-2], price_highs[-1]
+        if tail_close[i2] > tail_close[i1] and tail_ind[i2] < tail_ind[i1]:
+            gap = abs(float(tail_ind[i2]) - float(tail_ind[i1]))
+            conf = min(int(gap * 3 + 55), 88)
+            return {
+                'key': f'bearish_div_{indicator_name}', 'style': 'distrib',
+                'label': f'Bearish Divergence ({indicator_name.upper()})',
+                'short': f'DIV-{indicator_name[:3].upper()}', 'conf_pct': conf,
+                'conf': 'high' if conf >= 75 else 'med', 'candle_idx': len(df) - 1,
+            }
+    return None
+
+
+def _detect_bull_trap(df: pd.DataFrame, lookback: int = 20) -> dict | None:
+    """
+    Breakout gagal ('jebakan bandar' klasik): harga menembus level
+    tertinggi N-hari dengan volume besar, tapi dalam 1-3 candle berikutnya
+    balik CLOSE di BAWAH level yang baru saja ditembus — jebakan buyer
+    yang FOMO di titik breakout.
+    """
+    if len(df) < lookback + 5:
+        return None
+
+    vol_ma = float(df['Volume'].rolling(20).mean().iloc[-1])
+    current_close = float(df['Close'].iloc[-1])
+
+    for back in range(1, 4):
+        idx = len(df) - 1 - back
+        if idx < lookback:
+            continue
+        prior_high   = float(df['High'].iloc[idx - lookback:idx].max())
+        breakout_high = float(df['High'].iloc[idx])
+        breakout_vol  = float(df['Volume'].iloc[idx])
+
+        if breakout_high > prior_high and breakout_vol > vol_ma * 1.5 and current_close < prior_high:
+            fail_pct = (prior_high - current_close) / prior_high * 100
+            conf = min(int(50 + fail_pct * 5), 85)
+            return {
+                'key': 'bull_trap', 'style': 'distrib', 'label': 'Bull Trap (Breakout Gagal)',
+                'short': 'TRAP', 'conf_pct': conf, 'conf': 'high' if conf >= 75 else 'med',
+                'candle_idx': idx,
+            }
+    return None
+
+
+
 def analyse_bandarmology(df: pd.DataFrame) -> dict:
     if len(df) < 20:
         return {'signals': [], 'dominant': None, 'narasi_tech': '', 'narasi_plain': ''}
@@ -718,6 +819,19 @@ def analyse_bandarmology(df: pd.DataFrame) -> dict:
             signals.append({'key': 'shakeout', 'style': 'warn', 'label': 'Shakeout',
                              'short': 'SKO', 'conf_pct': conf, 'conf': _conf_label(conf), 'candle_idx': last})
 
+    # Fitur baru — Pattern Deteksi Tambahan: divergence (RSI & CMF) dan bull-trap.
+    # Sengaja pakai fungsi terpisah (bukan logic tersisip) supaya masing-masing
+    # bisa diaudit/diuji independen dari sinyal bandarmology yang sudah ada.
+    div_rsi = _detect_divergence(df, calculate_rsi(df), 'rsi', lookback=40, order=3)
+    if div_rsi:
+        signals.append(div_rsi)
+    div_cmf = _detect_divergence(df, calculate_cmf(df), 'cmf', lookback=40, order=3)
+    if div_cmf:
+        signals.append(div_cmf)
+    bull_trap = _detect_bull_trap(df, lookback=20)
+    if bull_trap:
+        signals.append(bull_trap)
+
     signals.sort(key=lambda x: x['conf_pct'], reverse=True)
     dominant = signals[0] if signals else None
     narasi_tech, narasi_plain = _build_narasi(signals, dominant)
@@ -772,6 +886,26 @@ def _build_narasi(signals: list, dominant: dict | None) -> tuple[str, str]:
         'accum_quiet': (
             "5 candle volume rendah konsisten, harga tidak turun — akumulasi senyap (quiet period).",
             "Tidak ada yang buang saham ini. Bandar sedang diam-diam mengumpulkan."
+        ),
+        'bullish_div_rsi': (
+            f"Harga bikin lower-low tapi RSI bikin higher-low — bullish divergence (conf {conf}%).",
+            "Harga masih turun tapi momentum jual sebenarnya melemah. Sering jadi tanda awal reversal naik."
+        ),
+        'bearish_div_rsi': (
+            f"Harga bikin higher-high tapi RSI bikin lower-high — bearish divergence (conf {conf}%).",
+            "Harga masih naik tapi momentum beli sebenarnya melemah. Waspada, kenaikan mulai kehabisan tenaga."
+        ),
+        'bullish_div_cmf': (
+            f"Harga bikin lower-low tapi tekanan beli (CMF) bikin higher-low — bullish divergence (conf {conf}%).",
+            "Harga turun tapi aliran dana justru mulai membaik. Indikasi akumulasi tersembunyi."
+        ),
+        'bearish_div_cmf': (
+            f"Harga bikin higher-high tapi tekanan beli (CMF) bikin lower-high — bearish divergence (conf {conf}%).",
+            "Harga naik tapi aliran dana justru mulai memburuk. Indikasi distribusi tersembunyi."
+        ),
+        'bull_trap': (
+            "Harga sempat menembus resistance dengan volume besar tapi gagal bertahan — bull trap.",
+            "Sempat kelihatan breakout meyakinkan, tapi ternyata jebakan. Yang FOMO di titik tembus kena jebak."
         ),
     }
     return narasi_map.get(key, ("Sinyal tidak dikenali.", "Pola belum terdefinisi."))
@@ -898,9 +1032,17 @@ def score_adx(ind: dict) -> tuple[float, str]:
     sig = "bull" if (bullish and strength != 'weak') else ("bear" if strength == 'strong' else "neut")
     return base, sig
 
-def compute_total_score(ind: dict) -> tuple[float, dict]:
+def compute_total_score(ind: dict, regime: dict | None = None) -> tuple[float, dict]:
     """
     Gabungkan 6 komponen. Hard filter: trend bearish total → cap skor.
+
+    Fitur baru (Konteks Pasar): parameter `regime` OPSIONAL (default None =
+    perilaku identik dengan sebelumnya, tidak ada perubahan). Kalau diisi
+    (hasil dari compute_market_regime), skor total diberi penyesuaian KECIL
+    & TERBATAS berdasarkan kondisi IHSG saat ini — bukan re-weight total,
+    cuma nudge kontekstual. Nilai per-komponen yang ditampilkan (breakdown)
+    TETAP murni/tidak disentuh, supaya tetap bisa diaudit terpisah dari
+    penyesuaian regime; hanya angka TOTAL akhir yang mendapat nudge.
     """
     st_score, st_sig = score_trend(ind)
     rs_score, rs_sig = score_rsi(ind)
@@ -924,7 +1066,149 @@ def compute_total_score(ind: dict) -> tuple[float, dict]:
         'squeeze': (round(sq_score, 1), sq_sig),
         'adx':     (round(ax_score, 1), ax_sig),
     }
+
+    total = apply_regime_adjustment(total, breakdown, regime)
     return round(total, 1), breakdown
+
+
+def apply_regime_adjustment(total_score: float, breakdown: dict, regime: dict | None) -> float:
+    """
+    Nudge KECIL & TERBATAS (bukan re-weight besar-besaran) berdasarkan
+    kondisi IHSG saat scan dijalankan:
+    - Trending Bullish  → sinyal momentum/breakout (squeeze release, ADX
+      bullish kuat) sedikit diperkuat — lebih reliable saat market trending.
+    - Choppy/Sideways   → sinyal mean-reversion (RSI di zona sehat, bukan
+      breakout) sedikit diperkuat — breakout lebih sering gagal saat choppy.
+    - Trending Bearish  → diskon kehati-hatian kecil untuk SEMUA saham,
+      terlepas dari sinyal individunya (melawan arus market itu sendiri
+      berisiko tambahan yang tidak tertangkap skor teknikal per-saham).
+    regime=None (default) → tidak ada perubahan sama sekali, identik
+    dengan versi tanpa fitur ini.
+    """
+    if not regime or regime.get('state') in (None, 'unknown', 'transisi'):
+        return total_score
+
+    state = regime['state']
+    adj = 0.0
+    sq_score, sq_sig = breakdown.get('squeeze', (0.0, 'neut'))
+    ax_score, ax_sig = breakdown.get('adx', (0.0, 'neut'))
+    rs_score, rs_sig = breakdown.get('rsi', (0.0, 'neut'))
+
+    if state == 'trending_bull':
+        if sq_sig == 'bull':
+            adj += sq_score * 0.15
+        if ax_sig == 'bull':
+            adj += ax_score * 0.10
+    elif state == 'choppy':
+        if rs_sig == 'bull':
+            adj += rs_score * 0.12
+        if sq_sig == 'bull':
+            adj -= sq_score * 0.10  # breakout signal sedikit didiskon saat choppy
+    elif state == 'trending_bear':
+        adj -= 3.0
+
+    return round(max(min(total_score + adj, 100.0), 0.0), 1)
+
+
+# =============================================================================
+# 5b. KONTEKS PASAR — fitur baru (Regime Detection, RS vs IHSG, Breadth)
+# =============================================================================
+# Filosofi: setiap saham selama ini di-skor TOTAL SENDIRIAN, tanpa
+# pembanding market. Saham score 75 saat IHSG rally semua-naik itu biasa
+# saja; saham score 65 yang tetap bertahan saat IHSG merah itu relative
+# strength beneran. Bagian ini menambah lensa "posisi saham relatif ke
+# market", bukan menggantikan skor teknikal individu yang sudah ada.
+
+def compute_market_regime(ihsg_df: pd.DataFrame | None) -> dict:
+    """
+    Klasifikasi kondisi IHSG saat ini pakai infrastruktur indikator yang
+    SAMA PERSIS dengan yang dipakai untuk saham individu (calculate_indicators)
+    — bukan logic terpisah, supaya konsisten & teruji dengan cara yang sama.
+    """
+    if ihsg_df is None or len(ihsg_df) < 60:
+        return {'state': 'unknown', 'label': 'Data IHSG tidak cukup', 'adx': 0.0}
+
+    try:
+        ind = calculate_indicators(ihsg_df)
+    except Exception:
+        return {'state': 'unknown', 'label': 'Gagal menghitung indikator IHSG', 'adx': 0.0}
+
+    strength = ind['adx_strength']
+    bullish  = ind['adx_bullish_dir']
+    above_trend = ind['above_ema50'] and ind['above_ema20']
+
+    if strength == 'strong' and bullish and above_trend:
+        state, label = 'trending_bull', '📈 Trending Bullish'
+    elif strength == 'strong' and not bullish:
+        state, label = 'trending_bear', '📉 Trending Bearish'
+    elif strength == 'weak':
+        state, label = 'choppy', '↔️ Choppy / Sideways'
+    else:
+        state, label = 'transisi', '🔄 Masa Transisi'
+
+    return {
+        'state': state, 'label': label, 'adx': ind['adx_val'],
+        'ihsg_close': ind['last_close'], 'rsi': ind['rsi_val'],
+        'above_ema50': ind['above_ema50'],
+    }
+
+
+def compute_relative_strength_vs_market(stock_df: pd.DataFrame, ihsg_df: pd.DataFrame | None,
+                                          lookback: int = 20) -> dict:
+    """
+    Excess return saham vs IHSG selama `lookback` hari terakhir, diselaraskan
+    berdasarkan tanggal (bukan cuma index posisi) supaya benar-benar
+    membandingkan periode yang sama persis.
+    """
+    default = {'rs_score': 50.0, 'label': 'N/A', 'excess_return_pct': 0.0}
+    if ihsg_df is None or len(ihsg_df) < lookback + 1 or len(stock_df) < lookback + 1:
+        return default
+
+    combined = pd.DataFrame({'stock': stock_df['Close'], 'ihsg': ihsg_df['Close']}).dropna()
+    if len(combined) < lookback + 1:
+        return default
+
+    stock_return = combined['stock'].iloc[-1] / combined['stock'].iloc[-lookback - 1] - 1
+    ihsg_return  = combined['ihsg'].iloc[-1] / combined['ihsg'].iloc[-lookback - 1] - 1
+    excess_pct = (stock_return - ihsg_return) * 100
+
+    # skala ke 0-100 pakai clamp_prob yang sudah ada, faktor 2.5 supaya
+    # excess return realistis (misal ±10%) memenuhi rentang skor secara wajar
+    rs_score = clamp_prob(50 + excess_pct * 2.5, 5, 95)
+
+    if rs_score >= 70: label = "Outperform Kuat"
+    elif rs_score >= 55: label = "Outperform"
+    elif rs_score >= 45: label = "Sejalan Market"
+    elif rs_score >= 30: label = "Underperform"
+    else: label = "Underperform Kuat"
+
+    return {'rs_score': round(rs_score, 1), 'label': label, 'excess_return_pct': round(excess_pct, 1)}
+
+
+def compute_market_breadth(all_breakdowns: list) -> dict:
+    """
+    Breadth dari SELURUH ticker yang berhasil dihitung indikatornya (bukan
+    cuma yang lolos filter skor/ADTV/harga — kalau cuma pakai yang lolos
+    filter, breadth otomatis bias bullish karena itu memang definisi lolos
+    filter). Dipakai sebagai konteks makro murah untuk melengkapi sinyal
+    per-saham.
+    """
+    if not all_breakdowns:
+        return {'bullish_pct': 0.0, 'total': 0, 'label': 'Tidak ada data'}
+
+    bull_count = sum(1 for bd in all_breakdowns if bd.get('trend', (0.0, 'neut'))[1] == 'bull')
+    total = len(all_breakdowns)
+    bullish_pct = bull_count / total * 100
+
+    if bullish_pct >= 65:
+        label = "Breadth Kuat (Bullish)"
+    elif bullish_pct >= 45:
+        label = "Breadth Netral"
+    else:
+        label = "Breadth Lemah (Bearish)"
+
+    return {'bullish_pct': round(bullish_pct, 1), 'total': total, 'label': label}
+
 
 # =============================================================================
 # 6. TRADING PLAN: ATR-BASED + MINIMUM R/R GUARANTEE
@@ -1095,6 +1379,132 @@ def build_trade_plan(last_close: float, atr_val: float, mode_params: dict) -> di
 
 
 # =============================================================================
+# 6b. GAP RISK (ARA/ARB) & LIKUIDITAS — fitur baru (Risk Spesifik IDX)
+# =============================================================================
+# Sumber verifikasi (dicek per Juli 2026, bukan dari ingatan training):
+# - ARA (Auto Rejection Atas) TIDAK berubah: <Rp200=35%, >Rp200–Rp5.000=25%,
+#   >Rp5.000=20%. Dikonfirmasi konsisten oleh Kontan, Kompas, Metro TV News,
+#   narotama.ac.id (semua merujuk Kep-00003/BEI/04-2025).
+# - ARB (Auto Rejection Bawah) BERUBAH efektif 8 April 2025: DISERAGAMKAN
+#   jadi 15% untuk SEMUA rentang harga (Kep-00002/BEI/04-2025 &
+#   Kep-00003/BEI/04-2025), menggantikan sistem berjenjang lama (35/25/20%
+#   mengikuti ARA). Dikonfirmasi masih berlaku per sumber terbaru (idxstock.com,
+#   Mei 2026) yang memberi contoh kasus riil (PANI, ARB 20%→dikoreksi jadi 15%
+#   pasca aturan baru, dengan hasil di-snap ke tick terdekat).
+# - Catatan: khusus hari pertama IPO, band ARA/ARB bisa 2x lipat — TIDAK
+#   ditangani di sini (kasus khusus, jarang relevan untuk screener watchlist
+#   reguler). Kalau perlu, verifikasi ulang sebelum diimplementasikan.
+def idx_ara_pct(price: float) -> float:
+    """Batas ARA (Auto Rejection Atas) sesuai fraksi harga BEI saat ini."""
+    if price < 200:
+        return 0.35
+    elif price <= 5000:
+        return 0.25
+    else:
+        return 0.20
+
+
+def idx_arb_pct(price: float) -> float:
+    """Batas ARB (Auto Rejection Bawah) — seragam 15% untuk semua rentang
+    harga sejak 8 April 2025."""
+    return 0.15
+
+
+def compute_gap_risk(last_close: float, stop_loss: float) -> dict:
+    """
+    Karena ARB kini FLAT 15% untuk semua saham (bukan lagi berjenjang
+    mengikuti harga), setiap saham punya 'ruang jatuh' teoretis yang SAMA
+    per hari — sekitar 15% dari harga kemarin. SL yang lebih KETAT (demi
+    R/R yang lebih bagus, seperti biasanya diinginkan) otomatis berarti
+    jarak dari rencana SL ke 'lantai ARB' makin LEBAR. Itu risiko gap yang
+    tidak kelihatan kalau cuma melihat persentase risiko rencana sendiri:
+    kalau terjadi gap-down penuh dalam satu sesi (berita buruk mendadak,
+    panic selling), harga bisa lompat lewat level SL tanpa sempat
+    tereksekusi di harga yang direncanakan, dan baru "berhenti" di lantai
+    ARB — jauh lebih dalam dari rencana awal.
+
+    exposure_ratio: 0 = SL sudah dekat lantai ARB (gap risk minimal, tapi
+    berarti SL sendiri sudah sangat lebar). 1 = SL sangat ketat dibanding
+    ruang ARB (gap risk tertinggi jika terjadi hari ekstrem).
+    """
+    arb_pct = idx_arb_pct(last_close)
+    worst_case_price = snap_to_tick(last_close * (1 - arb_pct), "ceil")
+
+    sl_distance_pct = max((last_close - stop_loss) / last_close * 100, 0.0)
+    unused_arb_pct  = max(arb_pct * 100 - sl_distance_pct, 0.0)
+    exposure_ratio  = round(unused_arb_pct / (arb_pct * 100), 2) if arb_pct > 0 else 0.0
+
+    if exposure_ratio >= 0.7:
+        risk_label, risk_color = "Rawan Gap", "#f85149"
+    elif exposure_ratio >= 0.4:
+        risk_label, risk_color = "Waspada", "#e3b341"
+    else:
+        risk_label, risk_color = "Relatif Aman", "#3fb950"
+
+    return {
+        'arb_pct':           round(arb_pct * 100),
+        'worst_case_price':  worst_case_price,
+        'sl_distance_pct':   round(sl_distance_pct, 1),
+        'unused_arb_pct':    round(unused_arb_pct, 1),
+        'exposure_ratio':    exposure_ratio,
+        'risk_label':        risk_label,
+        'risk_color':        risk_color,
+    }
+
+
+def compute_liquidity_impact(position_value: float, adtv: float) -> dict:
+    """
+    Position sizing sudah membatasi risiko modal, tapi belum mengecek
+    apakah UKURAN order itu sendiri realistis dieksekusi tanpa
+    menggerakkan harga secara signifikan (slippage). Rasio > 5-10% dari
+    ADTV adalah tanda peringatan khas untuk saham kurang likuid di IDX.
+    """
+    if adtv <= 0:
+        return {'impact_pct': 0.0, 'label': 'Data ADTV tidak cukup', 'color': '#8b949e'}
+    impact_pct = position_value / adtv * 100
+    if impact_pct >= 10:
+        label, color = "Tinggi — berpotensi gerakkan harga", "#f85149"
+    elif impact_pct >= 5:
+        label, color = "Sedang — perhatikan slippage", "#e3b341"
+    else:
+        label, color = "Rendah", "#3fb950"
+    return {'impact_pct': round(impact_pct, 1), 'label': label, 'color': color}
+
+
+def compute_correlation_matrix(all_data: dict, tickers_jk: list, lookback: int = 60) -> pd.DataFrame:
+    """Matriks korelasi return harian antar saham dari data yang SUDAH
+    terdownload (tidak ada network call tambahan)."""
+    returns = {}
+    for t in tickers_jk:
+        df = all_data.get(t)
+        if df is None or len(df) < lookback + 1:
+            continue
+        r = df['Close'].tail(lookback + 1).pct_change().dropna()
+        if len(r) >= lookback // 2:
+            returns[t] = r.reset_index(drop=True)
+    if len(returns) < 2:
+        return pd.DataFrame()
+    returns_df = pd.DataFrame(returns)
+    return returns_df.corr()
+
+
+def flag_high_correlation_clusters(corr_matrix: pd.DataFrame, threshold: float = 0.7) -> list:
+    """Daftar pasangan saham dengan korelasi >= threshold, diurutkan dari
+    yang paling berkorelasi. Dipakai untuk memperingatkan konsentrasi
+    risiko portofolio kalau beberapa saham hasil scan diambil sekaligus."""
+    if corr_matrix.empty:
+        return []
+    pairs = []
+    cols = list(corr_matrix.columns)
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            c = corr_matrix.iloc[i, j]
+            if pd.notna(c) and c >= threshold:
+                pairs.append((cols[i], cols[j], round(float(c), 2)))
+    return sorted(pairs, key=lambda x: -x[2])
+
+
+# =============================================================================
 # 7. DOWNLOAD ENGINE
 # =============================================================================
 def download_ticker_chunk(tickers: list, period_days: int, interval: str) -> dict:
@@ -1204,21 +1614,27 @@ def _cached_fetch_live_prices(tickers_tuple: tuple) -> dict:
 # =============================================================================
 # 8. MAIN STRATEGY ENGINE
 # =============================================================================
-def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd.DataFrame:
+def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str,
+                           ihsg_df: pd.DataFrame | None = None, regime: dict | None = None) -> pd.DataFrame:
     """
     Pipeline:
     1. Filter panjang data & kualitas data (is_tradeable_stock — FIX #10)
     2. Hitung indikator (termasuk ADX yang sudah diperbaiki — FIX #4)
-    3. Scoring 6 komponen (termasuk ADX sungguhan — FIX #5)
+    3. Scoring 6 komponen (termasuk ADX sungguhan — FIX #5) + nudge regime (baru)
     4. Trading plan ATR-based dengan zona beli yang sudah diperbaiki (FIX #2)
-    5. Position sizing
+    5. Position sizing + liquidity impact (baru) + gap-risk ARA/ARB (baru)
     6. Fetch live price, lalu hitung probabilitas SEKALI saja (FIX #9)
+
+    Parameter `ihsg_df`/`regime` OPSIONAL (default None) — kalau tidak
+    diisi, perilaku 100% identik dengan versi sebelum fitur Konteks Pasar
+    ditambahkan (RS vs IHSG jadi 'N/A', tidak ada nudge regime ke skor).
     """
     mode_params = INTRADAY_PARAMS if trading_mode == "Intraday (Fast Trade)" else SWING_PARAMS
     MIN_CANDLES = 60
 
     results = []
     skipped_reason = {}
+    all_breakdowns = []   # fitur baru: breadth dari SELURUH universe (bukan cuma yang lolos filter)
 
     for ticker, df in all_data.items():
         if len(df) < MIN_CANDLES:
@@ -1257,7 +1673,15 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             skipped_reason[ticker] = f"ADTV {ind['adtv']/1e6:.1f}M < minimum"
             continue
 
-        total_score, breakdown = compute_total_score(ind)
+        total_score, breakdown = compute_total_score(ind, regime=regime)
+
+        # Breadth harus mencerminkan SELURUH universe yang berhasil dihitung
+        # indikatornya, bukan cuma yang lolos threshold skor -- kalau cuma
+        # pakai yang lolos, breadth otomatis bias bullish (itu memang definisi
+        # lolos filter). Makanya breakdown direkam DI SINI, sebelum filter
+        # skor di bawah.
+        all_breakdowns.append(breakdown)
+
         if total_score < config['min_score_threshold']:
             skipped_reason[ticker] = f"score {total_score} < threshold"
             continue
@@ -1278,6 +1702,10 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         tp1, tp2, tp3 = plan['tp1'], plan['tp2'], plan['tp3']
         buy_min, buy_max = plan['buy_min'], plan['buy_max']
 
+        # Fitur baru: Gap Risk (ARA/ARB) & Relative Strength vs IHSG
+        gap_risk = compute_gap_risk(last_close, stop_loss)
+        rs_data  = compute_relative_strength_vs_market(df, ihsg_df, lookback=20)
+
         entry_ref      = float(buy_max)
         loss_per_share = entry_ref - stop_loss
         if loss_per_share <= 0:
@@ -1296,6 +1724,9 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
         if calc_lots < 1:
             skipped_reason[ticker] = "modal tidak cukup untuk 1 lot"
             continue
+
+        # Fitur baru: Liquidity Impact vs ADTV
+        liq_impact = compute_liquidity_impact(required_cap, ind['adtv'])
 
         clean_ticker = ticker.split('.')[0]
         tv_link = f"https://www.tradingview.com/chart/?symbol=IDX%3A{clean_ticker}"
@@ -1332,18 +1763,29 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
             "Partial Plan": plan['partial_plan'],
             "Lots":         int(calc_lots),
             "Alokasi (Rp)": required_cap,
+            "RS Score":     rs_data['rs_score'],
+            "RS Label":     rs_data['label'],
+            "Gap Risk":     gap_risk['risk_label'],
+            "Liq Impact":   liq_impact['label'],
             "_breakdown":   breakdown,
             "_vol_ctx":     vol_ctx,
             "_tape":        tape,
             "_bandar":      bandar,
             "_ind":         ind,
+            "_gap_risk":    gap_risk,
+            "_liq_impact":  liq_impact,
+            "_rs_data":     rs_data,
         })
+
+    breadth = compute_market_breadth(all_breakdowns)
 
     st.session_state['scan_meta'] = {
         'total_input': len(all_data),
         'lolos':       len(results),
         'difilter':    len(skipped_reason),
         'skipped':     skipped_reason,
+        'breadth':     breadth,
+        'regime':      regime,
     }
 
     if not results:
@@ -1426,8 +1868,189 @@ def quant_strategy_engine(all_data: dict, config: dict, trading_mode: str) -> pd
     )
 
 # =============================================================================
-# 9. RENDER HELPERS
+# 8b. INDICATOR HISTORY — dukungan untuk fitur Deep Dive
 # =============================================================================
+def compute_indicator_history(df: pd.DataFrame, n_days: int = 10) -> pd.DataFrame:
+    """
+    Hitung score & indikator kunci untuk N hari trading terakhir (bukan cuma
+    snapshot hari terakhir), dengan menjalankan ulang calculate_indicators/
+    compute_total_score pada window trailing yang berakhir di masing-masing
+    hari tersebut. Dipakai di Deep Dive untuk menunjukkan "bagaimana
+    perkembangan saham ini beberapa hari terakhir", bukan cuma potret sesaat.
+    """
+    MIN_CANDLES = 60
+    if len(df) < MIN_CANDLES + n_days:
+        n_days = max(1, len(df) - MIN_CANDLES)
+    if n_days <= 0:
+        return pd.DataFrame()
+
+    rows = []
+    for back in range(n_days, 0, -1):
+        end_idx = len(df) - back
+        if end_idx < MIN_CANDLES:
+            continue
+        window_df = df.iloc[:end_idx]
+        try:
+            ind = calculate_indicators(window_df)
+        except Exception:
+            continue
+        score, _ = compute_total_score(ind)
+        rows.append({
+            'date': df.index[end_idx - 1], 'close': ind['last_close'], 'score': score,
+            'rsi': ind['rsi_val'], 'cmf': ind['cmf_val'], 'adx': ind['adx_val'],
+        })
+
+    try:
+        ind_today = calculate_indicators(df)
+        score_today, _ = compute_total_score(ind_today)
+        rows.append({
+            'date': df.index[-1], 'close': ind_today['last_close'], 'score': score_today,
+            'rsi': ind_today['rsi_val'], 'cmf': ind_today['cmf_val'], 'adx': ind_today['adx_val'],
+        })
+    except Exception:
+        pass
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 8c. JURNAL SINYAL — penyimpanan persisten lintas sesi (fitur baru)
+# =============================================================================
+# Session state Streamlit tidak bertahan lintas restart server/browser baru,
+# jadi jurnal disimpan sebagai file CSV lokal di folder yang sama dengan
+# script ini (pola sama dengan load_local_emiten_csv), bukan session_state.
+JOURNAL_COLUMNS = [
+    'tanggal_sinyal', 'ticker', 'mode', 'harga_saat_sinyal',
+    'buy_min', 'buy_max', 'stop_loss', 'tp1', 'tp2', 'tp3',
+    'score', 'grade', 'status', 'tanggal_resolusi', 'hari_berjalan',
+]
+
+def _journal_path() -> str:
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        base_dir = os.getcwd()
+    return os.path.join(base_dir, "jurnal_sinyal.csv")
+
+
+def load_journal() -> pd.DataFrame:
+    path = _journal_path()
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=JOURNAL_COLUMNS)
+    try:
+        jdf = pd.read_csv(path)
+        for col in JOURNAL_COLUMNS:
+            if col not in jdf.columns:
+                jdf[col] = np.nan
+        return jdf[JOURNAL_COLUMNS]
+    except Exception:
+        return pd.DataFrame(columns=JOURNAL_COLUMNS)
+
+
+def append_to_journal(final_df: pd.DataFrame, trading_mode: str) -> int:
+    """
+    Tambahkan sinyal hasil scan hari ini ke jurnal. Dedup berdasarkan
+    (tanggal, ticker, mode) — re-run scan berkali-kali di hari yang sama
+    TIDAK membuat duplikat entry. Return jumlah entry BARU yang ditambahkan.
+    """
+    path = _journal_path()
+    existing = load_journal()
+    today_str = datetime.now().strftime('%Y-%m-%d')
+
+    existing_keys = set(
+        zip(existing['tanggal_sinyal'].astype(str), existing['ticker'].astype(str), existing['mode'].astype(str))
+    ) if not existing.empty else set()
+
+    new_rows = []
+    for _, row in final_df.iterrows():
+        key = (today_str, row['Ticker'], trading_mode)
+        if key in existing_keys:
+            continue
+        new_rows.append({
+            'tanggal_sinyal': today_str, 'ticker': row['Ticker'], 'mode': trading_mode,
+            'harga_saat_sinyal': row['Live Price'], 'buy_min': row['Buy Min'], 'buy_max': row['Buy Max'],
+            'stop_loss': row['Stop Loss'], 'tp1': row['TP1'], 'tp2': row['TP2'], 'tp3': row['TP3'],
+            'score': row['Score'], 'grade': row['Grade'], 'status': 'Open',
+            'tanggal_resolusi': '', 'hari_berjalan': 0,
+        })
+
+    if not new_rows:
+        return 0
+
+    combined = pd.concat([existing, pd.DataFrame(new_rows)], ignore_index=True)
+    try:
+        combined.to_csv(path, index=False)
+    except Exception:
+        return 0
+    return len(new_rows)
+
+
+def _resolve_signal_outcome(df_hist: pd.DataFrame, stop_loss: float, tp1: float, tp2: float, tp3: float):
+    """
+    Scan kronologis sejak tanggal sinyal: level manapun (SL atau TP1/2/3)
+    yang tersentuh LEBIH DULU menentukan status akhir. Asumsi konservatif:
+    kalau SL & TP sama-sama tersentuh di HARI YANG SAMA (ambigu dari data
+    harian OHLC — tidak tahu urutan intraday-nya), anggap SL duluan supaya
+    tidak melebih-lebihkan tingkat keberhasilan.
+    """
+    for idx, row in df_hist.iterrows():
+        if row['Low'] <= stop_loss:
+            return 'SL', idx
+        if row['High'] >= tp3:
+            return 'TP3', idx
+        if row['High'] >= tp2:
+            return 'TP2', idx
+        if row['High'] >= tp1:
+            return 'TP1', idx
+    return 'Open', None
+
+
+def evaluate_journal_outcomes(journal_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Untuk setiap entry berstatus 'Open', unduh histori harga sejak tanggal
+    sinyal dan cek apakah SL/TP sudah tersentuh. Entry yang SUDAH resolved
+    tidak dicek ulang (hemat panggilan network). Mengembalikan DataFrame
+    yang sudah diperbarui (tidak mengubah file — pemanggil yang simpan bila
+    perlu).
+    """
+    if journal_df.empty:
+        return journal_df
+
+    jdf = journal_df.copy()
+    open_mask = jdf['status'].astype(str) == 'Open'
+    if not open_mask.any():
+        return jdf
+
+    for i in jdf[open_mask].index:
+        row = jdf.loc[i]
+        ticker_jk = row['ticker'] if str(row['ticker']).upper().endswith('.JK') else f"{row['ticker']}.JK"
+        try:
+            sinyal_date = pd.to_datetime(row['tanggal_sinyal'])
+            days_span = max((datetime.now() - sinyal_date.to_pydatetime()).days + 2, 3)
+            chunk = download_ticker_chunk([ticker_jk], period_days=days_span, interval="1d")
+            df_hist = chunk.get(ticker_jk)
+            if df_hist is None or df_hist.empty:
+                continue
+            df_hist = df_hist[df_hist.index >= sinyal_date]
+            if df_hist.empty:
+                continue
+            status, resolusi_idx = _resolve_signal_outcome(
+                df_hist, float(row['stop_loss']), float(row['tp1']), float(row['tp2']), float(row['tp3'])
+            )
+            hari_berjalan = (datetime.now() - sinyal_date.to_pydatetime()).days
+            jdf.at[i, 'hari_berjalan'] = hari_berjalan
+            if status != 'Open':
+                jdf.at[i, 'status'] = status
+                jdf.at[i, 'tanggal_resolusi'] = str(resolusi_idx.date()) if resolusi_idx is not None else ''
+        except Exception:
+            continue
+
+    try:
+        jdf.to_csv(_journal_path(), index=False)
+    except Exception:
+        pass
+    return jdf
+
+
 def _pill(label: str, signal: str) -> str:
     return f'<span class="ind-pill ind-{signal}">{label}</span>'
 
@@ -1787,6 +2410,11 @@ def compute_best_buy_score(row: pd.Series) -> tuple[float, list[str]]:
     4. Bandar confidence       15   accum: high=15/med=8/low=3 | distrib: penalti skala confidence
     5. Tape confirmation       10   accum=+10, distrib=-5
     6. Volume konteks          10   vol spike + candle bullish=+10
+    7. Relative Strength vs IHSG (baru) ±7  outperform kuat=+7 s.d. underperform kuat=-7
+
+    Total dijaga tetap 0-100 lewat clamp akhir, walau komponen 1-6 sendiri
+    sudah menjumlah 100 — RS jadi modifier tipis di atas, bukan porsi tetap,
+    supaya tidak mengubah bobot komponen yang sudah ada.
     """
     reasons = []
     total   = 0.0
@@ -1844,7 +2472,20 @@ def compute_best_buy_score(row: pd.Series) -> tuple[float, list[str]]:
         elif bull_ok:
             total += 3; reasons.append("📊 Candle bullish (vol normal)")
 
-    return round(max(total, 0.0), 1), reasons
+    # 7. Relative Strength vs IHSG (baru, Konteks Pasar) — modifier tipis,
+    # cuma aktif kalau data IHSG tersedia saat scan (RS Label != 'N/A').
+    rs_label = row.get("RS Label", "N/A")
+    rs_score = row.get("RS Score", 50.0)
+    if rs_label and rs_label != "N/A":
+        rs_adj = round((rs_score - 50.0) / 45.0 * 7.0, 1)  # ±7 poin maksimum
+        total += rs_adj
+        if rs_adj > 0:
+            reasons.append(f"📈 RS vs IHSG: {rs_label}")
+        elif rs_adj < 0:
+            reasons.append(f"📉 RS vs IHSG: {rs_label}")
+
+    return round(max(min(total, 100.0), 0.0), 1), reasons
+
 
 
 def pick_best_buy(df: pd.DataFrame) -> tuple[str | None, float, list[str], bool]:
@@ -1956,6 +2597,74 @@ def render_no_best_buy_notice():
         '</div></div>',
         unsafe_allow_html=True
     )
+
+
+def render_market_context_banner(regime: dict | None, breadth: dict | None):
+    """
+    Fitur baru (Konteks Pasar): tampilkan kondisi IHSG & breadth SEKALI di
+    atas hasil scan, sebagai konteks makro murah yang melengkapi sinyal
+    per-saham. Tidak render apa pun kalau data tidak tersedia (misal IHSG
+    gagal diunduh) — fail gracefully, bukan menampilkan placeholder kosong.
+    """
+    if not regime or regime.get('state') in (None, 'unknown'):
+        return
+    state_colors = {
+        'trending_bull': '#3fb950', 'trending_bear': '#f85149',
+        'choppy': '#e3b341', 'transisi': '#8b949e',
+    }
+    color = state_colors.get(regime['state'], '#8b949e')
+    breadth = breadth or {}
+    breadth_html = ""
+    if breadth.get('total', 0) > 0:
+        breadth_html = (
+            f'<div style="border-left:1px solid #30363d;height:2.2rem;margin:0 0.2rem;"></div>'
+            f'<div><span style="font-size:0.65rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px;">Market Breadth</span><br>'
+            f'<span style="font-size:0.9rem;font-weight:800;color:#c9d1d9;">{breadth["label"]}</span>'
+            f'<span style="font-size:0.68rem;color:#8b949e;"> ({breadth["bullish_pct"]:.0f}% bullish dari {breadth["total"]} saham)</span></div>'
+        )
+    html = (
+        f'<div style="display:flex;gap:0.8rem;flex-wrap:wrap;align-items:center;'
+        f'background:rgba(255,255,255,0.03);border:1px solid #21262d;border-radius:8px;'
+        f'padding:0.6rem 1rem;margin-bottom:1rem;">'
+        f'  <div><span style="font-size:0.65rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px;">Kondisi IHSG Saat Ini</span><br>'
+        f'  <span style="font-size:0.9rem;font-weight:800;color:{color};">{regime["label"]}</span>'
+        f'  <span style="font-size:0.68rem;color:#8b949e;"> (ADX {regime.get("adx",0):.0f})</span></div>'
+        f'  {breadth_html}'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_correlation_warning(all_data: dict, tickers_jk: list, threshold: float = 0.7):
+    """
+    Fitur baru (Risk Spesifik IDX): flag konsentrasi risiko portofolio kalau
+    beberapa saham hasil scan bergerak sangat mirip. Tidak render apa pun
+    kalau tidak ada pasangan yang melewati threshold — tidak menambah
+    noise di UI saat semua saham cukup terdiversifikasi.
+    """
+    corr = compute_correlation_matrix(all_data, tickers_jk, lookback=60)
+    clusters = flag_high_correlation_clusters(corr, threshold=threshold)
+    if not clusters:
+        return
+
+    pairs_html = "".join(
+        f'<span style="display:inline-block;background:rgba(248,81,73,0.1);'
+        f'border:1px solid rgba(248,81,73,0.3);border-radius:6px;padding:0.15rem 0.5rem;'
+        f'margin:0.15rem;font-size:0.72rem;color:#f85149;font-weight:600;">{a} ↔ {b} ({c:.2f})</span>'
+        for a, b, c in clusters[:8]
+    )
+    html = (
+        f'<div style="background:rgba(248,81,73,0.06);border:1px solid rgba(248,81,73,0.25);'
+        f'border-radius:8px;padding:0.7rem 1rem;margin:1rem 0;">'
+        f'  <div style="font-size:0.85rem;font-weight:800;color:#f85149;">⚠️ Konsentrasi Risiko Portofolio</div>'
+        f'  <div style="font-size:0.72rem;color:#c9d1d9;margin-top:0.25rem;">'
+        f'  Saham-saham berikut bergerak sangat mirip (korelasi return 60 hari ≥ {threshold}) — '
+        f'  kalau diambil beberapa sekaligus, risiko portofolio riil lebih tinggi dari yang terlihat per-saham:'
+        f'  </div>'
+        f'  <div style="margin-top:0.4rem;">{pairs_html}</div>'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -2076,15 +2785,366 @@ def render_trade_cards(df: pd.DataFrame, max_cards: int = 6, best_ticker: str | 
                     f'  <div><div class="label">Maks Alokasi</div>'
                     f'  <div style="color:#58a6ff;font-weight:600">{fmt_idr(row["Alokasi (Rp)"])}</div></div>'
                     f'</div>'
+                    f'{_render_risk_context_row(row)}'
                     f'{dim_close}'
                     f'{tape_bandar_html}'
                     f'</div>'
                 )
                 st.markdown(html, unsafe_allow_html=True)
 
+def _render_risk_context_row(row: pd.Series) -> str:
+    """
+    Fitur baru: baris kompak Gap Risk (ARA/ARB) · Liquidity Impact · RS vs
+    IHSG di bagian bawah kartu trade. Dipisah jadi fungsi sendiri supaya
+    render_trade_cards tidak makin panjang & tetap mudah diaudit terpisah.
+    """
+    gap_risk   = row.get("_gap_risk", {})
+    liq_impact = row.get("_liq_impact", {})
+    rs_label   = row.get("RS Label", "N/A")
+
+    gap_color = gap_risk.get('risk_color', '#8b949e')
+    gap_text  = gap_risk.get('risk_label', '—')
+    liq_color = liq_impact.get('color', '#8b949e')
+    liq_text  = liq_impact.get('label', '—')
+
+    rs_color = '#8b949e'
+    if rs_label not in ('N/A', None):
+        if 'Outperform' in rs_label: rs_color = '#3fb950'
+        elif 'Underperform' in rs_label: rs_color = '#f85149'
+        else: rs_color = '#e3b341'
+
+    return (
+        f'<div style="margin-top:0.4rem;padding-top:0.4rem;border-top:1px solid #21262d;'
+        f'display:grid;grid-template-columns:repeat(3,1fr);gap:0.3rem;font-size:0.68rem;">'
+        f'  <div><div class="label" style="font-size:0.58rem;">Gap Risk (ARA/ARB)</div>'
+        f'  <div style="color:{gap_color};font-weight:700;">{gap_text}</div></div>'
+        f'  <div><div class="label" style="font-size:0.58rem;">Liquidity Impact</div>'
+        f'  <div style="color:{liq_color};font-weight:700;">{liq_text}</div></div>'
+        f'  <div><div class="label" style="font-size:0.58rem;">RS vs IHSG</div>'
+        f'  <div style="color:{rs_color};font-weight:700;">{rs_label}</div></div>'
+        f'</div>'
+    )
+
 # =============================================================================
-# 13. SIDEBAR & CONFIG
+# 12b. FITUR BARU — Deep Dive / Bandingkan / Jurnal Sinyal
 # =============================================================================
+def get_period_for_mode(trading_mode: str) -> tuple[int, str]:
+    """
+    Satu sumber kebenaran untuk (period_days, interval) per mode trading —
+    dipakai baik oleh scan utama, Deep Dive, maupun Jurnal Sinyal, supaya
+    ketiganya tidak bisa diam-diam divergen di masa depan.
+    """
+    return (30, "60m") if trading_mode == "Intraday (Fast Trade)" else (400, "1d")
+
+
+def _render_price_level_chart(df: pd.DataFrame, plan: dict, lookback_days: int = 90):
+    """Chart harga + level TP/SL/zona-beli pakai Altair (bundled bawaan
+    Streamlit, tidak nambah dependency baru)."""
+    import altair as alt
+
+    chart_df = df.tail(lookback_days).reset_index()
+    date_col = chart_df.columns[0]
+    chart_df = chart_df.rename(columns={date_col: 'Tanggal'})
+
+    price_line = alt.Chart(chart_df).mark_line(color='#58a6ff', size=2).encode(
+        x=alt.X('Tanggal:T', title=None),
+        y=alt.Y('Close:Q', title='Harga (Rp)', scale=alt.Scale(zero=False)),
+    )
+
+    level_specs = [
+        (plan['stop_loss'], '#f85149', 'SL'),
+        (plan['buy_min'],   '#e3b341', 'Buy Min'),
+        (plan['buy_max'],   '#e3b341', 'Buy Max'),
+        (plan['tp1'],       '#3fb950', 'TP1'),
+        (plan['tp2'],       '#3fb950', 'TP2'),
+        (plan['tp3'],       '#bc8cff', 'TP3'),
+    ]
+    layers = [price_line]
+    for val, color, _label in level_specs:
+        rule = alt.Chart(pd.DataFrame({'y': [val]})).mark_rule(
+            color=color, strokeDash=[4, 3], size=1.4
+        ).encode(y='y:Q')
+        layers.append(rule)
+
+    full_chart = (
+        alt.layer(*layers)
+        .properties(height=340)
+        .configure_axis(labelColor='#8b949e', titleColor='#c9d1d9', gridColor='#21262d', domainColor='#30363d')
+        .configure_view(strokeOpacity=0)
+    )
+    st.altair_chart(full_chart, use_container_width=True)
+    st.caption(
+        "🟡 Zona Beli (Buy Min–Buy Max) · 🔴 Stop Loss · 🟢 TP1/TP2 · 🟣 TP3 — "
+        f"garis putus-putus di atas menunjukkan level dari rencana trading saat ini."
+    )
+
+
+def _render_score_history_chart(hist_df: pd.DataFrame):
+    if hist_df.empty:
+        st.caption("Data historis tidak cukup untuk menampilkan tren skor.")
+        return
+    import altair as alt
+    score_chart = alt.Chart(hist_df).mark_line(point=True, color='#d2a8ff', size=2).encode(
+        x=alt.X('date:T', title=None),
+        y=alt.Y('score:Q', title='Score', scale=alt.Scale(domain=[0, 100])),
+    ).properties(height=180).configure_axis(
+        labelColor='#8b949e', titleColor='#c9d1d9', gridColor='#21262d', domainColor='#30363d'
+    ).configure_view(strokeOpacity=0)
+    st.altair_chart(score_chart, use_container_width=True)
+
+
+def render_deep_dive_tab(config_engine: dict, trading_mode: str):
+    """
+    Fitur baru: analisa mendalam SATU saham — bisa dipilih dari hasil scan
+    terakhir, ATAU diketik bebas (ticker apa pun, di luar watchlist utama).
+    Menampilkan: breakdown skor lengkap, riwayat skor beberapa hari
+    terakhir, SEMUA sinyal tape/bandarmology (bukan cuma yang dominan),
+    chart harga dengan level TP/SL/zona-beli, dan trading plan penuh.
+    """
+    st.markdown("### 🔬 Deep Dive — Analisa Mendalam Satu Saham")
+    st.caption(
+        "Pilih dari hasil scan terakhir, atau ketik kode saham apa pun (termasuk "
+        "yang tidak ada di watchlist utama) untuk laporan analisa penuh."
+    )
+
+    last_final_df = st.session_state.get('last_final_df')
+    scan_tickers = (
+        list(last_final_df['Ticker']) if last_final_df is not None and not last_final_df.empty else []
+    )
+
+    col1, col2 = st.columns([2, 2])
+    with col1:
+        picked = None
+        if scan_tickers:
+            picked = st.selectbox("Dari hasil scan terakhir:", ["-- pilih --"] + scan_tickers)
+        else:
+            st.caption("(Belum ada hasil scan tersimpan — jalankan Screener dulu, atau ketik manual di samping.)")
+    with col2:
+        manual_ticker = st.text_input("Atau ketik kode saham manual:", value="", placeholder="contoh: ADRO")
+
+    final_ticker_raw = (
+        manual_ticker.strip() if manual_ticker.strip()
+        else (picked if picked and picked != "-- pilih --" else None)
+    )
+
+    if not final_ticker_raw:
+        st.info("👆 Pilih atau ketik satu kode saham untuk memulai analisa mendalam.")
+        return
+
+    ticker_jk = final_ticker_raw.upper() if final_ticker_raw.upper().endswith(".JK") else f"{final_ticker_raw.upper()}.JK"
+
+    if not st.button("🔬 Analisa Mendalam", type="primary"):
+        return
+
+    p_days, p_interval = get_period_for_mode(trading_mode)
+    with st.spinner(f"Mengunduh & menganalisa {ticker_jk}…"):
+        chunk = download_ticker_chunk([ticker_jk], p_days, p_interval)
+        df = chunk.get(ticker_jk)
+
+    if df is None or df.empty:
+        st.error(f"❌ Data untuk {ticker_jk} tidak ditemukan. Cek kembali kode sahamnya.")
+        return
+    if len(df) < 60:
+        st.warning(f"⚠️ Data historis {ticker_jk} cuma {len(df)} candle (minimal 60) — analisa tidak bisa diandalkan.")
+        return
+
+    last_close_raw = float(df['Close'].iloc[-1])
+    tradeable, reason = is_tradeable_stock(df, last_close_raw)
+    if not tradeable:
+        st.warning(f"⚠️ {ticker_jk}: {reason} — hasil analisa di bawah tetap ditampilkan untuk referensi, tapi berhati-hatilah.")
+
+    try:
+        ind = calculate_indicators(df)
+    except Exception as e:
+        st.error(f"❌ Gagal menghitung indikator untuk {ticker_jk}: {e}")
+        return
+
+    mode_params = INTRADAY_PARAMS if trading_mode == "Intraday (Fast Trade)" else SWING_PARAMS
+    score, breakdown = compute_total_score(ind)
+    plan = build_trade_plan(ind['last_close'], ind['atr_val'], mode_params)
+    vol_ctx = analyse_volume_context(df)
+    tape = analyse_tape(df)
+    bandar = analyse_bandarmology(df)
+
+    live_prices = _cached_fetch_live_prices((ticker_jk,))
+    lp = live_prices.get(ticker_jk)
+    live_price = float(lp) if lp and np.isfinite(float(lp)) and float(lp) > 0 else ind['last_close']
+    live_src = "live" if lp else "delayed"
+
+    grade = "A" if score >= 80 else ("B" if score >= 65 else "C")
+    clean_ticker = ticker_jk.split('.')[0]
+
+    st.markdown("---")
+    header_html = (
+        f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem;">'
+        f'  <div><span class="ticker" style="font-size:2rem;">{clean_ticker}</span>'
+        f'  <span style="margin-left:0.6rem;">{_grade_badge(grade)}</span>'
+        f'  <span class="score-badge" style="margin-left:0.4rem;">Score {score}</span></div>'
+        f'  <a class="tv-link" href="https://www.tradingview.com/chart/?symbol=IDX%3A{clean_ticker}" target="_blank">📊 TradingView</a>'
+        f'</div>'
+    )
+    st.markdown(header_html, unsafe_allow_html=True)
+    st.markdown(
+        _price_status_html(int(round(live_price)), int(round(ind['last_close'])),
+                            int(plan['buy_min']), int(plan['buy_max']), live_src),
+        unsafe_allow_html=True,
+    )
+
+    def pill_from_bd(key, label):
+        if key not in breakdown:
+            return ""
+        v, sig = breakdown[key]
+        return _pill(f"{label} {v:.0f}", sig)
+
+    pills = (pill_from_bd("trend", "EMA") + pill_from_bd("rsi", "RSI") + pill_from_bd("cmf", "CMF")
+             + pill_from_bd("volume", "VOL") + pill_from_bd("squeeze", "SQZ") + pill_from_bd("adx", "ADX"))
+    st.markdown(pills + _adx_info_badge(ind['adx_val'], ind['adx_strength'], ind['adx_bullish_dir']), unsafe_allow_html=True)
+
+    st.markdown("#### 📈 Chart Harga + Level Trading Plan")
+    _render_price_level_chart(df, plan)
+
+    st.markdown("#### 📊 Tren Score — 10 Hari Terakhir")
+    hist_df = compute_indicator_history(df, n_days=10)
+    _render_score_history_chart(hist_df)
+    with st.expander("Lihat tabel angka mentah"):
+        st.dataframe(hist_df, use_container_width=True, hide_index=True)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("#### 💰 Trading Plan Lengkap")
+        live_rr = compute_live_rr(live_price, plan['stop_loss'], plan['tp1'], plan['tp2'], plan['tp3'])
+        st.markdown(
+            f"- **Zona Beli:** {fmt_num(plan['buy_min'])} – {fmt_num(plan['buy_max'])}\n"
+            f"- **Stop Loss:** {fmt_num(plan['stop_loss'])} (-{round(max(live_rr['risk_pct'],0),1)}%)\n"
+            f"- **TP1:** {fmt_num(plan['tp1'])} (1:{round(live_rr['rr1'],2)}, {round(live_rr['up1_pct'],1):+.1f}%)\n"
+            f"- **TP2:** {fmt_num(plan['tp2'])} (1:{round(live_rr['rr2'],2)}, {round(live_rr['up2_pct'],1):+.1f}%)\n"
+            f"- **TP3:** {fmt_num(plan['tp3'])} (1:{round(live_rr['rr3'],2)}, {round(live_rr['up3_pct'],1):+.1f}%)\n"
+            f"- **Trailing:** {plan['ts_rule']}\n"
+            f"- **Partial Exit:** {plan['partial_plan']}"
+        )
+    with col_b:
+        st.markdown("#### 🔍 Semua Sinyal Terdeteksi")
+        tape_sigs = tape.get('signals', [])
+        if tape_sigs:
+            st.markdown("**Tape Reading:**")
+            for s in tape_sigs:
+                st.markdown(f"- {_tape_pill(s[3], s[1], s[4])} {s[2]}", unsafe_allow_html=True)
+        bandar_sigs = bandar.get('signals', [])
+        if bandar_sigs:
+            st.markdown("**Bandarmology:**")
+            for s in bandar_sigs:
+                st.markdown(f"- {_tape_pill(s['short'], s['style'], s['conf_pct'])} {s['label']} ({s['conf']})", unsafe_allow_html=True)
+        if not tape_sigs and not bandar_sigs:
+            st.caption("Tidak ada sinyal tape/bandarmology signifikan terdeteksi saat ini.")
+        if bandar.get('narasi_plain'):
+            st.markdown(f"> {bandar['narasi_plain']}")
+
+    st.markdown(_render_volume_ctx_html(vol_ctx), unsafe_allow_html=True)
+
+
+def render_comparison_tab():
+    """Fitur baru: bandingkan 2-4 saham hasil scan terakhir berdampingan
+    dalam satu tabel metrik lengkap."""
+    st.markdown("### ⚖️ Bandingkan Saham")
+    last_final_df = st.session_state.get('last_final_df')
+
+    if last_final_df is None or last_final_df.empty:
+        st.info("ℹ️ Belum ada hasil scan tersimpan. Jalankan Screener dulu di tab tersebut.")
+        return
+
+    tickers_avail = list(last_final_df['Ticker'])
+    picked = st.multiselect("Pilih 2–4 saham dari hasil scan terakhir untuk dibandingkan:", tickers_avail)
+
+    if len(picked) < 2:
+        st.info("👆 Pilih minimal 2 saham untuk dibandingkan.")
+        return
+    if len(picked) > 4:
+        st.warning("⚠️ Maksimal 4 saham sekaligus — 4 pilihan pertama yang dipakai.")
+        picked = picked[:4]
+
+    rows_meta = [
+        ("Score",        lambda r: f"{r['Score']}"),
+        ("Grade",        lambda r: r['Grade']),
+        ("Harga Live",   lambda r: f"Rp {fmt_num(r['Live Price'])}"),
+        ("Zona Beli",    lambda r: f"{fmt_num(r['Buy Min'])}–{fmt_num(r['Buy Max'])}"),
+        ("TP1 (R/R)",    lambda r: f"{fmt_num(r['TP1'])} ({r['R/R TP1']})"),
+        ("TP2 (R/R)",    lambda r: f"{fmt_num(r['TP2'])} ({r['R/R TP2']})"),
+        ("TP3 (R/R)",    lambda r: f"{fmt_num(r['TP3'])} ({r['R/R TP3']})"),
+        ("Stop Loss",    lambda r: f"{fmt_num(r['Stop Loss'])} ({r['Risk%']})"),
+        ("RSI",          lambda r: f"{r['RSI']}"),
+        ("CMF",          lambda r: f"{r['CMF']}"),
+        ("ADX",          lambda r: f"{r['ADX']:.0f} {'▲' if r['ADX Bullish'] else '▼'} ({r.get('ADX Strength','—')})"),
+        ("Prob Entry",   lambda r: f"{r['Prob Entry']}%"),
+        ("Prob TP1",     lambda r: f"{r['Prob TP1']}%"),
+        ("Confidence",   lambda r: r['Confidence']),
+        ("Sinyal Bandar", lambda r: (r.get('_bandar', {}).get('dominant') or {}).get('label', '—')),
+        ("RS vs IHSG",   lambda r: r.get('RS Label', 'N/A')),
+        ("Gap Risk",     lambda r: r.get('Gap Risk', '—')),
+        ("Liquidity Impact", lambda r: r.get('Liq Impact', '—')),
+        ("Lot Saran",    lambda r: f"{int(r['Lots'])} lot"),
+        ("Alokasi",      lambda r: fmt_idr(r['Alokasi (Rp)'])),
+    ]
+
+    comp_data = {"Metrik": [label for label, _ in rows_meta]}
+    for t in picked:
+        row = last_final_df[last_final_df['Ticker'] == t].iloc[0]
+        comp_data[t] = [fn(row) for _, fn in rows_meta]
+
+    comp_df = pd.DataFrame(comp_data)
+    st.dataframe(comp_df, use_container_width=True, hide_index=True, height=min(80 + len(rows_meta) * 36, 700))
+    st.caption(
+        "Kolom Prob Entry/TP1 adalah estimasi heuristik (bukan probabilitas statistik tervalidasi) — "
+        "lihat juga catatan di tab Screener."
+    )
+
+
+def render_journal_tab():
+    """Fitur baru: jurnal sinyal persisten lintas sesi (disimpan sebagai
+    CSV lokal, bukan session_state — supaya bertahan antar restart)."""
+    st.markdown("### 📓 Jurnal Sinyal")
+    st.caption(
+        "Setiap kali Screener dijalankan, sinyal yang lolos otomatis dicatat di sini "
+        "(disimpan sebagai `jurnal_sinyal.csv` di folder script ini). Klik tombol di bawah "
+        "untuk mengecek apakah sinyal lama sudah kena TP/SL sejak dicatat."
+    )
+
+    journal_df = load_journal()
+    if journal_df.empty:
+        st.info("ℹ️ Jurnal masih kosong. Jalankan Screener untuk mulai mencatat sinyal secara otomatis.")
+        return
+
+    if st.button("🔄 Cek Update Status (TP/SL sudah kena?)"):
+        with st.spinner("Mengecek histori harga untuk semua sinyal yang masih 'Open'…"):
+            journal_df = evaluate_journal_outcomes(journal_df)
+        st.success("✅ Status diperbarui.")
+
+    resolved = journal_df[journal_df['status'] != 'Open']
+    wins  = resolved[resolved['status'].isin(['TP1', 'TP2', 'TP3'])]
+    losses = resolved[resolved['status'] == 'SL']
+    open_count = len(journal_df) - len(resolved)
+
+    win_rate = (len(wins) / len(resolved) * 100) if len(resolved) > 0 else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: st.metric("Total Sinyal", len(journal_df))
+    with c2: st.metric("Win Rate", f"{win_rate:.0f}%", help=f"{len(wins)} profit dari {len(resolved)} sinyal selesai")
+    with c3: st.metric("Masih Open", open_count)
+    with c4: st.metric("Kena SL", len(losses))
+
+    st.caption(
+        f"Win rate dihitung dari {len(resolved)} sinyal yang SUDAH selesai (TP atau SL tersentuh); "
+        f"{open_count} sinyal lain masih berjalan dan belum dihitung ke win rate."
+    )
+
+    st.markdown("---")
+    status_filter = st.multiselect(
+        "Filter status:", ["Open", "TP1", "TP2", "TP3", "SL"], default=["Open", "TP1", "TP2", "TP3", "SL"]
+    )
+    display_df = journal_df[journal_df['status'].isin(status_filter)].sort_values('tanggal_sinyal', ascending=False)
+    st.dataframe(display_df, use_container_width=True, hide_index=True, height=min(80 + len(display_df) * 36, 600))
+
+
+
 st.sidebar.header("⚙️ Parameter Algoritma")
 capital          = st.sidebar.number_input("Total Modal Akun (Rp)", value=50_000_000, step=5_000_000, min_value=1_000_000)
 risk_limit       = st.sidebar.slider("Maks Risiko per Trade (%)", 0.5, 5.0, 2.0, 0.5)
@@ -2117,11 +3177,34 @@ config_engine = {
 # =============================================================================
 # 14. MAIN UI
 # =============================================================================
+# ROMBAK INTERFACE — navigasi mode utama (fitur baru). Semua mode berbagi
+# trading_mode & config_engine yang sama di bawah, jadi parameter algoritma
+# di sidebar tetap relevan lintas mode.
+st.markdown("## 🧭 IDX Screener Ultra")
+app_mode = st.radio(
+    "Mode:",
+    ["🔍 Screener", "🔬 Deep Dive", "⚖️ Bandingkan", "📓 Jurnal Sinyal"],
+    horizontal=True,
+)
+st.markdown("---")
+
 trading_mode = st.radio(
     "📊 **Pilih Gaya Trading:**",
     ["Swing Trading (Harian)", "Intraday (Fast Trade)"],
     horizontal=True,
 )
+
+if app_mode == "🔬 Deep Dive":
+    render_deep_dive_tab(config_engine, trading_mode)
+    st.stop()
+elif app_mode == "⚖️ Bandingkan":
+    render_comparison_tab()
+    st.stop()
+elif app_mode == "📓 Jurnal Sinyal":
+    render_journal_tab()
+    st.stop()
+
+# --- app_mode == "🔍 Screener" lanjut ke alur di bawah seperti biasa ---
 
 st.markdown("### 📋 Daftar Saham")
 
@@ -2202,6 +3285,7 @@ with btn_col2:
         st.session_state['last_loaded_mode'] = None
         st.session_state['scan_meta']        = {}
         st.session_state['download_failures'] = {}
+        st.session_state['last_final_df']    = None
         st.success("Reset berhasil.")
 
 # =============================================================================
@@ -2219,7 +3303,7 @@ if execute_scan:
     # trading day) agar EMA200 benar-benar punya cukup data untuk aktif.
     # Versi lama (120 hari ≈ 85 trading day) membuat bonus EMA200 di
     # score_trend jadi dead code untuk hampir semua saham.
-    p_days, p_interval = (30, "60m") if trading_mode == "Intraday (Fast Trade)" else (400, "1d")
+    p_days, p_interval = get_period_for_mode(trading_mode)   # DRY: satu sumber, sama dgn Deep Dive
     CHUNK_SIZE = 15 if trading_mode == "Intraday (Fast Trade)" else 40
 
     sorted_tickers = sorted(set(tickers_ready))
@@ -2235,6 +3319,14 @@ if execute_scan:
         status_ph.markdown(f"⏳ Mengunduh {n_done}/{len(sorted_tickers)} emiten (Batch {idx+1}/{total_chunks})…")
         progress_b.progress(int((idx + 1) / total_chunks * 100))
         buffer.update(download_ticker_chunk(chunk, p_days, p_interval))
+
+    # Fitur baru (Konteks Pasar): unduh IHSG sekali per scan, dipakai untuk
+    # Relative Strength & Market Regime Detection. Kegagalan di sini TIDAK
+    # menggagalkan scan utama — RS/regime otomatis jadi 'N/A'/'unknown'
+    # (fallback graceful, konsisten dgn parameter opsional di engine).
+    status_ph.markdown("⏳ Mengunduh data IHSG untuk konteks pasar…")
+    ihsg_chunk = download_ticker_chunk(["^JKSE"], p_days, p_interval)
+    st.session_state['ihsg_data'] = ihsg_chunk.get("^JKSE")
 
     status_ph.empty()
     progress_b.empty()
@@ -2266,7 +3358,24 @@ if execute_scan:
 
 # ── Auto-render jika data tersedia & mode cocok ────────────────────────────
 if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] == trading_mode:
-    final_df = quant_strategy_engine(st.session_state['raw_market_data'], config_engine, trading_mode)
+    # Fitur baru (Konteks Pasar): hitung regime IHSG sekali per render dari
+    # data yang sudah diunduh saat scan — bukan network call baru.
+    ihsg_df_current = st.session_state.get('ihsg_data')
+    current_regime  = compute_market_regime(ihsg_df_current)
+
+    final_df = quant_strategy_engine(
+        st.session_state['raw_market_data'], config_engine, trading_mode,
+        ihsg_df=ihsg_df_current, regime=current_regime,
+    )
+
+    # Fitur baru: simpan hasil scan supaya bisa dipakai tab Deep Dive &
+    # Bandingkan tanpa perlu re-scan, dan catat otomatis ke Jurnal Sinyal
+    # (dedup per hari sudah ditangani di dalam append_to_journal).
+    st.session_state['last_final_df'] = final_df
+    if not final_df.empty:
+        n_logged = append_to_journal(final_df, trading_mode)
+        if n_logged > 0:
+            st.caption(f"📓 {n_logged} sinyal baru dicatat otomatis ke Jurnal Sinyal.")
 
     st.markdown(f"### 📈 Hasil Scan [{trading_mode}]")
     st.caption(
@@ -2275,6 +3384,9 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
         "statistik yang tervalidasi/backtested. Gunakan sebagai perbandingan relatif "
         "antar saham, bukan angka presisi untuk sizing taruhan."
     )
+
+    current_breadth = st.session_state.get('scan_meta', {}).get('breadth')
+    render_market_context_banner(current_regime, current_breadth)
 
     best_ticker, best_score, best_reasons, has_rec = pick_best_buy(final_df)
     if best_ticker:
@@ -2286,6 +3398,15 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
         st.info("ℹ️ Tidak ada saham yang lolos filter pada scan ini.")
 
     render_trade_cards(final_df, max_cards=6, best_ticker=best_ticker)
+
+    # Fitur baru (Risk Spesifik IDX): peringatan konsentrasi risiko kalau
+    # beberapa saham hasil scan bergerak sangat mirip.
+    if not final_df.empty:
+        render_correlation_warning(
+            st.session_state['raw_market_data'],
+            [t + ".JK" if not t.endswith(".JK") else t for t in final_df.head(10)["Ticker"]],
+            threshold=0.7,
+        )
 
     # ── Tabel Ringkas ──────────────────────────────────────────────────────
     if not final_df.empty:
@@ -2339,6 +3460,9 @@ if st.session_state['raw_market_data'] and st.session_state['last_loaded_mode'] 
                 "Status":      _validity_label(row),
                 "Sinyal Bandar": _bandar_label(row),
                 "Tape":        _tape_label(row),
+                "RS vs IHSG":  row.get("RS Label", "N/A"),
+                "Gap Risk":    row.get("Gap Risk", "—"),
+                "Liq. Impact": row.get("Liq Impact", "—"),
                 "Lot Saran":   f"{int(row['Lots'])} lot",
                 "Alokasi":     fmt_idr(row["Alokasi (Rp)"]),
             })
