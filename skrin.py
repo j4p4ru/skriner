@@ -17,9 +17,12 @@ except ImportError:
     import altair as alt
 
 # =============================================================================
-# CHANGELOG v9.4 (HASH FIX)
+# CHANGELOG v9.5 (DEEP DIVE UI & ALTAIR OPTIMIZATION)
 # =============================================================================
-# 1. [HOTFIX] Memperbaiki ValueError pada _hash_d saat menerima input DataFrame Pandas (IHSG).
+# 1. [UI] Rombak total tampilan Deep Dive. Header dibuat lebih besar dengan info Live Price.
+# 2. [UI] Trading Plan di Deep Dive kini menggunakan layout card grid yang rapi (bukan list bullet).
+# 3. [CHART] Jika pakai Altair (fallback), kini ditambahkan bar Volume di bawah chart utama,
+#    label teks pada garis TP/SL, dan warna grid yang disesuaikan dengan dark theme.
 # =============================================================================
 
 SECTOR_MAP = {
@@ -35,7 +38,7 @@ SECTOR_MAP = {
     'TPIA': 'Chemical', 'BRPT': 'Energy', 'AKRA': 'Energy', 'PGAS': 'Energy',
 }
 
-st.set_page_config(page_title="Quant Trader - IDX Screener v9.4", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Quant Trader - IDX Screener v9.5", layout="wide", initial_sidebar_state="expanded")
 
 if 'theme' not in st.session_state: st.session_state['theme'] = 'dark'
 
@@ -838,14 +841,33 @@ def _render_chart(df, plan, ticker):
         fig.update_layout(title=f'{ticker} - Price & Plan', template='plotly_dark', height=500, yaxis=dict(title='Harga', side='left'), yaxis2=dict(title='Volume', overlaying='y', side='right', showgrid=False), xaxis_rangeslider_visible=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         st.plotly_chart(fig, use_container_width=True)
     else:
-        # Altair Fallback
-        chart_df = df.reset_index().rename(columns={df.index.name or 'index': 'Tanggal'})
-        price_line = alt.Chart(chart_df).mark_line(color='#58a6ff').encode(x='Tanggal:T', y='Close:Q')
-        layers = [price_line]
+        # Optimized Altair Fallback (Volume + Labels + Grid)
+        df_chart = df.reset_index().rename(columns={df.index.name or 'index': 'Date'})
+        
+        price_line = alt.Chart(df_chart).mark_line(color='#58a6ff', strokeWidth=2).encode(
+            x=alt.X('Date:T', title=None),
+            y=alt.Y('Close:Q', title='Harga (Rp)', scale=alt.Scale(zero=False))
+        )
+        
+        volume_bars = alt.Chart(df_chart).mark_bar().encode(
+            x='Date:T',
+            y=alt.Y('Volume:Q', title='Volume'),
+            color=alt.condition('datum.Open <= datum.Close', alt.value('#3fb950'), alt.value('#f85149'))
+        ).properties(height=80)
+        
+        rules = []
         for v, c, n in [(plan['tp3'],'#bc8cff','TP3'),(plan['tp2'],'#3fb950','TP2'),(plan['tp1'],'#3fb950','TP1'),(plan['buy_max'],'#e3b341','Buy Max'),(plan['buy_min'],'#e3b341','Buy Min'),(plan['stop_loss'],'#f85149','SL')]:
-            rule = alt.Chart(pd.DataFrame({'y': [v]})).mark_rule(color=c, strokeDash=[4,3]).encode(y='y:Q')
-            layers.append(rule)
-        st.altair_chart(alt.layer(*layers).properties(height=400).configure_axis(labelColor='#8b949e', titleColor='#c9d1d9', gridColor='#21262d'), use_container_width=True)
+            rule_df = pd.DataFrame({'y': [v], 'label': [f'{n}: {fmt_num(v)}']})
+            rule = alt.Chart(rule_df).mark_rule(color=c, strokeDash=[4,3]).encode(y='y:Q')
+            text = alt.Chart(rule_df).mark_text(align='left', dx=5, dy=-5, color=c, fontSize=10).encode(y='y:Q', text='label:N')
+            rules.extend([rule, text])
+            
+        price_chart = alt.layer(price_line, *rules).properties(height=350)
+        full_chart = alt.vconcat(price_chart, volume_bars).resolve_scale(x='shared').configure_axis(
+            labelColor='#8b949e', titleColor='#c9d1d9', gridColor='#21262d', domainColor='#30363d'
+        ).configure_view(strokeOpacity=0)
+        
+        st.altair_chart(full_chart, use_container_width=True)
 
 def render_deep_dive(cfg, tm, cal_probs):
     st.markdown("### 🔬 Deep Dive")
@@ -877,18 +899,54 @@ def render_deep_dive(cfg, tm, cal_probs):
     mp = INTRADAY_PARAMS if tm == "Intraday (Fast Trade)" else SWING_PARAMS
     sc, bd = compute_total_score(ind); pl = build_plan(ind['last_close'], ind['atr_val'], mp)
     vc, tp, bd_ = analyse_volume_context(df), analyse_tape(df, ind_s), analyse_bandar(df, ind_s)
-    lp = _cached_live((tjk,)).get(tjk); lp = float(lp) if lp and float(lp)>0 else ind['last_close']
-    st.markdown(f"### {tr.upper()} | Score: {sc} | {_gb('A' if sc>=80 else 'B' if sc>=65 else 'C')}")
+    lp_data = _cached_live((tjk,)).get(tjk)
+    live_price = float(lp_data) if lp_data and float(lp_data)>0 else ind['last_close']
+    live_src = "Live" if lp_data else "Delayed"
+    gr = "A" if sc >= 80 else ("B" if sc >= 65 else "C")
+    
+    st.markdown("---")
+    header_html = f"""
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem;margin-bottom:1rem;">
+        <div>
+            <span class="ticker" style="font-size:2rem;">{tr.upper()}</span>
+            <span style="margin-left:0.6rem;">{_gb(gr)}</span>
+            <span class="score-badge" style="margin-left:0.4rem;">Score {sc}</span>
+        </div>
+        <div style="text-align:right;">
+            <div style="font-size:0.75rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.4px;">Harga {live_src}</div>
+            <div style="font-size:1.4rem;font-weight:800;color:#58a6ff;">Rp {fmt_num(live_price)}</div>
+        </div>
+    </div>
+    """
+    st.markdown(header_html, unsafe_allow_html=True)
+    
+    st.markdown("#### 📈 Chart Harga & Level Trading Plan")
     _render_chart(df, pl, tr.upper())
-    cA, cB = st.columns(2)
+    
+    cA, cB = st.columns([3, 2])
     with cA:
-        st.markdown("**Trading Plan**")
-        st.markdown(f"- Buy: {fmt_num(pl['buy_min'])} – {fmt_num(pl['buy_max'])}\n- SL: {fmt_num(pl['stop_loss'])}\n- TP1: {fmt_num(pl['tp1'])}\n- TP2: {fmt_num(pl['tp2'])}\n- TP3: {fmt_num(pl['tp3'])}")
+        st.markdown("#### 💰 Trading Plan")
+        plan_html = f"""
+        <div class="metric-card" style="padding:1rem;">
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem;text-align:center;margin-bottom:0.5rem;">
+                <div><div class="label">TP1</div><div class="tp">{fmt_num(pl['tp1'])}</div></div>
+                <div><div class="label">TP2</div><div class="tp">{fmt_num(pl['tp2'])}</div></div>
+                <div><div class="label">TP3</div><div class="tp" style="color:#bc8cff;">{fmt_num(pl['tp3'])}</div></div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;text-align:center;border-top:1px solid #30363d;padding-top:0.5rem;">
+                <div><div class="label">Buy Zone</div><div style="color:#e3b341;font-weight:700;">{fmt_num(pl['buy_min'])} - {fmt_num(pl['buy_max'])}</div></div>
+                <div><div class="label">Stop Loss</div><div class="sl">{fmt_num(pl['stop_loss'])}</div></div>
+            </div>
+        </div>
+        """
+        st.markdown(plan_html, unsafe_allow_html=True)
+        st.markdown(f"**Trailing:** {pl['ts_rule']}  \n**Partial Exit:** {pl['partial_plan']}")
+        
     with cB:
-        st.markdown("**Sinyal Bandar**")
+        st.markdown("#### 🔍 Sinyal Bandar")
         if bd_.get('signals'):
             for s in bd_['signals'][:3]: st.markdown(f"- {_tpill(s['short'],s['style'],s['conf_pct'])} {s['label']}", unsafe_allow_html=True)
-        else: st.write("Tidak ada.")
+        else: st.write("Tidak ada sinyal signifikan terdeteksi.")
 
 def render_compare():
     st.markdown("### ⚖️ Bandingkan")
@@ -1003,7 +1061,7 @@ max_px = st.sidebar.number_input("Harga Max", value=25_000, step=500, min_value=
 min_sc = st.sidebar.slider("Min Score", 50, 85, 60, 5)
 cfg = {'total_capital':cap, 'capital_risk_limit_pct':rl, 'max_capital_allocation_pct':al, 'min_adtv':min_adtv, 'min_price':min_px, 'max_price':max_px, 'min_score_threshold':float(min_sc)}
 
-st.markdown("## 🧭 IDX Screener v9.4")
+st.markdown("## 🧭 IDX Screener v9.5")
 app_mode = st.radio("Mode", ["🔍 Screener", "🔬 Deep Dive", "⚖️ Bandingkan", "📓 Jurnal", "📊 Backtest"], horizontal=True)
 st.markdown("---")
 tm = st.radio("Gaya Trading", ["Swing Trading", "Intraday (Fast Trade)"], horizontal=True)
