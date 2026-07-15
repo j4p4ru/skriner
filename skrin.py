@@ -7,13 +7,20 @@ import os
 import hashlib
 import concurrent.futures
 from datetime import datetime, timedelta
-import plotly.graph_objects as go
+
+# Auto-fallback ke Altair jika Plotly tidak terinstall
+try:
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+    import altair as alt
 
 # =============================================================================
-# CHANGELOG v9.1 (FINAL FIX)
+# CHANGELOG v9.2 (ROBUST FALLBACK)
 # =============================================================================
-# 1. [HOTFIX] Memperbaiki SyntaxError pada perhitungan market breadth (nested if-else).
-# 2. [HOTFIX] Memperbaiki parsing R/R TP2 dan TP3 di Best Buy Engine yang sebelumnya hanya membaca TP1.
+# 1. [HOTFIX] Auto-fallback ke Altair jika Plotly tidak terinstall. 
+#    Mencegah ModuleNotFoundError di Streamlit Cloud yang belum ada plotly di requirements.txt.
 # =============================================================================
 
 SECTOR_MAP = {
@@ -29,7 +36,7 @@ SECTOR_MAP = {
     'TPIA': 'Chemical', 'BRPT': 'Energy', 'AKRA': 'Energy', 'PGAS': 'Energy',
 }
 
-st.set_page_config(page_title="Quant Trader - IDX Screener v9.1", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Quant Trader - IDX Screener v9.2", layout="wide", initial_sidebar_state="expanded")
 
 if 'theme' not in st.session_state: st.session_state['theme'] = 'dark'
 
@@ -519,7 +526,6 @@ def quant_strategy_engine(ad, cfg, tm, ihsg=None, regime=None):
             "_ind": ind, "_vol_ctx": vc, "_tape": tp, "_bandar": bd_, "_gap_risk": gr_risk, "_liq_impact": li, "_breakdown": bd
         })
     
-    # HOTFIX: Breadth calculation
     if all_bd:
         bull_count = sum(1 for b in all_bd if b.get('trend', (0.0, 'neut'))[1] == 'bull')
         total_bd = len(all_bd)
@@ -734,14 +740,11 @@ def compute_best_buy_ev(row):
     if vc.get("valid") and vc.get("vol_ratio",0)>=1.3 and vc.get("candle_dir")=="bullish": tot += 10
     if row.get("RS Label","N/A") != "N/A":
         ra = round((row.get("RS Score",50.0)-50.0)/45.0*7.0, 1); tot += ra
-    
-    # HOTFIX: R/R parsing
     try:
         r1 = float(str(row["R/R TP1"]).split(":")[1])
         r2 = float(str(row["R/R TP2"]).split(":")[1])
         r3 = float(str(row["R/R TP3"]).split(":")[1])
     except: r1, r2, r3 = 1.5, 2.5, 4.0
-        
     p1, p2, p3, ps = row["Prob TP1"]/100, row["Prob TP2"]/100, row["Prob TP3"]/100, row["Prob SL"]/100
     ev = (0.4*p1*r1) + (0.4*p2*r2) + (0.2*p3*r3) - (ps*1.0)
     return round(ev,2), round(max(min(tot,100),0),1), reasons
@@ -816,7 +819,6 @@ def render_cards(df, max_c=6, bt=None, cal_probs={}):
                 ch = '<div><span class="best-buy-crown">👑 Best Buy</span></div>' if is_best else ''
                 bh = f'<div class="{v["banner_cls"]}"><div style="font-size:0.78rem;font-weight:800;color:{v["title_color"]};">{v["title"]}</div><div style="font-size:0.68rem;color:#c9d1d9;">{v["detail"]}</div></div>' if v['status'] in ['expired','waiting'] else ''
                 do, dc_ = '<div class="dimmed">' if v['status']=='expired' else '<div>', '</div>'
-                
                 cal_html = ""
                 if cal_probs:
                     for lo, hi in cal_probs:
@@ -824,18 +826,27 @@ def render_cards(df, max_c=6, bt=None, cal_probs={}):
                             actual = cal_probs[(lo,hi)]
                             cal_html = f'<span style="font-size:0.6rem;color:#8b949e;">(Hist: {actual}%)</span>'
                             break
-
                 html = f'<div class="metric-card {cls}">{ch}<div style="display:flex;justify-content:space-between;margin-bottom:0.3rem;"><span class="ticker">{r["Ticker"]}</span><div style="display:flex;gap:0.4rem;align-items:center;">{_gb(r["Grade"])}<span class="score-badge">Score {r["Score"]}</span></div></div><div style="margin-bottom:0.5rem;">{ph}</div>{_html_vc(r["_vol_ctx"])}{bh}{_html_ps(r["Live Price"], r["Last Price"], r["Buy Min"], r["Buy Max"], r.get("Live Src","delayed"))}{do}<div class="price-range">{fmt_num(r["Buy Min"])} – {fmt_num(r["Buy Max"])}</div><div class="label" style="margin-bottom:0.6rem;">Area Buy · ATR {r["ATR"]} {_adx_b(r["ADX"], r.get("ADX Strength","weak"), r.get("ADX Bullish",False))}</div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0.4rem;margin-bottom:0.6rem;border-top:1px solid #30363d;padding-top:0.4rem;"><div><div class="label">TP1 <span class="rr-badge">({r["R/R TP1"]})</span></div><div class="tp">{fmt_num(r["TP1"])} <span style="font-size:0.68rem;">{r.get("Upside TP1","")}</span></div></div><div><div class="label">TP2</div><div class="tp">{fmt_num(r["TP2"])}</div></div><div><div class="label">TP3</div><div class="tp" style="color:#bc8cff;">{fmt_num(r["TP3"])}</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;margin-bottom:0.4rem;"><div><div class="label">Stop Loss</div><div class="sl">{fmt_num(r["Stop Loss"])} <span style="font-size:0.68rem;">{r["Risk%"]}</span></div></div><div><div class="label">Trailing</div><div class="ts-rule" style="font-size:0.78rem;">{r["TS Kriteria"]}</div></div></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0.35rem;margin-bottom:0.5rem;background:rgba(88,166,255,0.05);border:1px solid rgba(88,166,255,0.18);border-radius:6px;padding:0.45rem 0.5rem;"><div><div class="label">Prob Entry {cal_html}</div><div style="color:#58a6ff;font-weight:800;">{r["Prob Entry"]}%</div></div><div><div class="label">Prob TP1</div><div style="color:#3fb950;font-weight:800;">{r["Prob TP1"]}%</div></div><div><div class="label">Prob SL</div><div style="color:#f85149;font-weight:800;">{r["Prob SL"]}%</div></div></div><div style="border-top:1px solid #30363d;padding-top:0.4rem;display:grid;grid-template-columns:1fr 1fr;gap:0.3rem;font-size:0.75rem;"><div><div class="label">Lots</div><div style="color:#fff;font-weight:600">{int(r["Lots"])} Lot</div></div><div><div class="label">Alokasi</div><div style="color:#58a6ff;font-weight:600">{fmt_idr(r["Alokasi (Rp)"])}</div></div></div>{dc_}{_html_tb(r["_tape"], r["_bandar"])}</div>'
                 st.markdown(html, unsafe_allow_html=True)
 
-def _plotly_chart(df, plan, ticker):
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price', increasing_line_color='#3fb950', decreasing_line_color='#f85149'))
-    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume', marker_color=['#3fb950' if c>=o else '#f85149' for c,o in zip(df['Close'],df['Open'])], yaxis='y2', opacity=0.3))
-    for v, c, n in [(plan['tp3'],'#bc8cff','TP3'),(plan['tp2'],'#3fb950','TP2'),(plan['tp1'],'#3fb950','TP1'),(plan['buy_max'],'#e3b341','Buy Max'),(plan['buy_min'],'#e3b341','Buy Min'),(plan['stop_loss'],'#f85149','SL')]:
-        fig.add_hline(y=v, line_dash="dash", line_color=c, annotation_text=f"{n}: {fmt_num(v)}", annotation_position="top left", annotation_font_size=10, annotation_font_color=c)
-    fig.update_layout(title=f'{ticker} - Price & Plan', template='plotly_dark', height=500, yaxis=dict(title='Harga', side='left'), yaxis2=dict(title='Volume', overlaying='y', side='right', showgrid=False), xaxis_rangeslider_visible=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-    st.plotly_chart(fig, use_container_width=True)
+def _render_chart(df, plan, ticker):
+    if PLOTLY_AVAILABLE:
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price', increasing_line_color='#3fb950', decreasing_line_color='#f85149'))
+        fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume', marker_color=['#3fb950' if c>=o else '#f85149' for c,o in zip(df['Close'],df['Open'])], yaxis='y2', opacity=0.3))
+        for v, c, n in [(plan['tp3'],'#bc8cff','TP3'),(plan['tp2'],'#3fb950','TP2'),(plan['tp1'],'#3fb950','TP1'),(plan['buy_max'],'#e3b341','Buy Max'),(plan['buy_min'],'#e3b341','Buy Min'),(plan['stop_loss'],'#f85149','SL')]:
+            fig.add_hline(y=v, line_dash="dash", line_color=c, annotation_text=f"{n}: {fmt_num(v)}", annotation_position="top left", annotation_font_size=10, annotation_font_color=c)
+        fig.update_layout(title=f'{ticker} - Price & Plan', template='plotly_dark', height=500, yaxis=dict(title='Harga', side='left'), yaxis2=dict(title='Volume', overlaying='y', side='right', showgrid=False), xaxis_rangeslider_visible=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        # Altair Fallback
+        chart_df = df.reset_index().rename(columns={df.index.name or 'index': 'Tanggal'})
+        price_line = alt.Chart(chart_df).mark_line(color='#58a6ff').encode(x='Tanggal:T', y='Close:Q')
+        layers = [price_line]
+        for v, c, n in [(plan['tp3'],'#bc8cff','TP3'),(plan['tp2'],'#3fb950','TP2'),(plan['tp1'],'#3fb950','TP1'),(plan['buy_max'],'#e3b341','Buy Max'),(plan['buy_min'],'#e3b341','Buy Min'),(plan['stop_loss'],'#f85149','SL')]:
+            rule = alt.Chart(pd.DataFrame({'y': [v]})).mark_rule(color=c, strokeDash=[4,3]).encode(y='y:Q')
+            layers.append(rule)
+        st.altair_chart(alt.layer(*layers).properties(height=400).configure_axis(labelColor='#8b949e', titleColor='#c9d1d9', gridColor='#21262d'), use_container_width=True)
 
 def render_deep_dive(cfg, tm, cal_probs):
     st.markdown("### 🔬 Deep Dive")
@@ -858,7 +869,7 @@ def render_deep_dive(cfg, tm, cal_probs):
     vc, tp, bd_ = analyse_volume_context(df), analyse_tape(df, ind_s), analyse_bandar(df, ind_s)
     lp = _cached_live((tjk,)).get(tjk); lp = float(lp) if lp and float(lp)>0 else ind['last_close']
     st.markdown(f"### {tr.upper()} | Score: {sc} | {_gb('A' if sc>=80 else 'B' if sc>=65 else 'C')}")
-    _plotly_chart(df, pl, tr.upper())
+    _render_chart(df, pl, tr.upper())
     cA, cB = st.columns(2)
     with cA:
         st.markdown("**Trading Plan**")
@@ -916,9 +927,15 @@ def render_backtest():
     with c2: st.metric("Win Rate", f"{wins/(wins+losses)*100:.0f}%")
     with c3: st.metric("Profit Factor", f"{pf:.2f}")
     with c4: st.metric("Max Drawdown", f"{mdd:.1f}%")
-    fig = go.Figure(go.Scatter(x=eq_s.index, y=eq_s.values, fill='tozeroy', line_color='#58a6ff'))
-    fig.update_layout(title='Equity Curve (Risk 2% per trade)', template='plotly_dark', height=400, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-    st.plotly_chart(fig, use_container_width=True)
+    
+    if PLOTLY_AVAILABLE:
+        fig = go.Figure(go.Scatter(x=eq_s.index, y=eq_s.values, fill='tozeroy', line_color='#58a6ff'))
+        fig.update_layout(title='Equity Curve (Risk 2% per trade)', template='plotly_dark', height=400, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        eq_df = pd.DataFrame({'Trade': eq_s.index, 'Equity': eq_s.values})
+        fig = alt.Chart(eq_df).mark_area(line={'color':'#58a6ff'}, color='#58a6ff').encode(x='Trade', y='Equity')
+        st.altair_chart(fig.properties(height=400), use_container_width=True)
 
 def render_bb_banner(t, ev, r):
     v = _check_validity(r["Live Price"], r["Stop Loss"], r["Buy Min"], r["Buy Max"])
@@ -970,7 +987,7 @@ max_px = st.sidebar.number_input("Harga Max", value=25_000, step=500, min_value=
 min_sc = st.sidebar.slider("Min Score", 50, 85, 60, 5)
 cfg = {'total_capital':cap, 'capital_risk_limit_pct':rl, 'max_capital_allocation_pct':al, 'min_adtv':min_adtv, 'min_price':min_px, 'max_price':max_px, 'min_score_threshold':float(min_sc)}
 
-st.markdown("## 🧭 IDX Screener v9.1")
+st.markdown("## 🧭 IDX Screener v9.2")
 app_mode = st.radio("Mode", ["🔍 Screener", "🔬 Deep Dive", "⚖️ Bandingkan", "📓 Jurnal", "📊 Backtest"], horizontal=True)
 st.markdown("---")
 tm = st.radio("Gaya Trading", ["Swing Trading", "Intraday (Fast Trade)"], horizontal=True)
