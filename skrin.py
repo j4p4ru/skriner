@@ -10,22 +10,12 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 
 # =============================================================================
-# CHANGELOG v9.0 (FINAL PHASE - STRATEGIC ANALYTICS & POLISH)
+# CHANGELOG v9.1 (FINAL FIX)
 # =============================================================================
-# 1. [STRATEGY] Backtest Module: Tab baru untuk simulasikan performa strategi
-#    berbasis data Jurnal Sinyal. Menghitung Total Return, Win Rate, Profit Factor,
-#    Max Drawdown, dan menampilkan Equity Curve (Plotly).
-# 2. [ALGO] Probability Calibration: Jika data Jurnal > 20 sinyal selesai, sistem
-#    mengkalibrasi "Prob Entry" heuristik menjadi "Calibrated Prob" berdasarkan
-#    win rate historis nyata per bin skor.
-# 3. [RISK] Sector Diversification: Map ticker ke sektor (Banking, Coal, dll).
-#    Peringatan jika Top 5 rekomendasi terlalu terkonsentrasi di 1 sektor.
-# 4. [UI/UX] Light/Dark Mode Toggle di sidebar. CSS disesuaikan dinamis.
-# 5. [ALERT] Best Buy Alert System: Mencatat sinyal Best Buy ke alerts.log
-#    untuk integrasi automation webhook/Telegram di masa depan.
+# 1. [HOTFIX] Memperbaiki SyntaxError pada perhitungan market breadth (nested if-else).
+# 2. [HOTFIX] Memperbaiki parsing R/R TP2 dan TP3 di Best Buy Engine yang sebelumnya hanya membaca TP1.
 # =============================================================================
 
-# Mapping Sektor IDX (Simplified / Fallback jika tidak ada data yfinance)
 SECTOR_MAP = {
     'BBRI': 'Banking', 'BBCA': 'Banking', 'BMRI': 'Banking', 'BBNI': 'Banking', 'BBTN': 'Banking', 'BNII': 'Banking', 'BNGA': 'Banking', 'BJBR': 'Banking', 'BTPS': 'Banking', 'BRIS': 'Banking',
     'TLKM': 'Telecom', 'EXCL': 'Telecom', 'ISAT': 'Telecom', 'FREN': 'Telecom', 'MTEL': 'Telecom',
@@ -34,16 +24,13 @@ SECTOR_MAP = {
     'ADRO': 'Coal', 'ITMG': 'Coal', 'PTBA': 'Coal', 'HRUM': 'Coal', 'BUMI': 'Coal', 'INDY': 'Coal',
     'MDKA': 'Metals', 'ANTM': 'Metals', 'INCO': 'Metals', 'INAF': 'Metals', 'ISSP': 'Metals',
     'JSMR': 'Infra', 'WIKA': 'Infra', 'WSKT': 'Infra', 'PTPP': 'Infra', 'PPRE': 'Infra', 'ACST': 'Infra',
-    'KLBF': 'Pharma', 'INAF': 'Pharma', 'DVLA': 'Pharma', 'KAEF': 'Pharma',
+    'KLBF': 'Pharma', 'DVLA': 'Pharma', 'KAEF': 'Pharma',
     'GOTO': 'Tech', 'BUKA': 'Tech', 'EMTK': 'Tech', 'MLPT': 'Tech', 'MTDL': 'Tech',
     'TPIA': 'Chemical', 'BRPT': 'Energy', 'AKRA': 'Energy', 'PGAS': 'Energy',
 }
 
-st.set_page_config(page_title="Quant Trader - IDX Screener v9.0", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Quant Trader - IDX Screener v9.1", layout="wide", initial_sidebar_state="expanded")
 
-# =============================================================================
-# THEME TOGGLE
-# =============================================================================
 if 'theme' not in st.session_state: st.session_state['theme'] = 'dark'
 
 def inject_css():
@@ -98,18 +85,12 @@ def inject_css():
 
 inject_css()
 
-# =============================================================================
-# SESSION STATE
-# =============================================================================
 for key, default in [
     ('raw_market_data', {}), ('last_loaded_mode', None), ('scan_meta', {}),
     ('download_failures', {}), ('last_final_df', None), ('ihsg_data', None),
 ]:
     if key not in st.session_state: st.session_state[key] = default
 
-# =============================================================================
-# HELPER & PARSER
-# =============================================================================
 def fmt_idr(val):
     try:
         if val is None or (isinstance(val, float) and np.isnan(val)): return "Rp 0"
@@ -138,9 +119,6 @@ def load_local_emiten_csv():
 
 def tickers_from_text(text): return [t.upper() if t.upper().endswith(".JK") else f"{t.upper()}.JK" for t in re.split(r"[,\s\n]+", text.strip()) if t.strip()]
 
-# =============================================================================
-# INDICATORS
-# =============================================================================
 def calculate_atr(df, w=14):
     pc = df['Close'].shift(1)
     tr = pd.concat([df['High']-df['Low'], (df['High']-pc).abs(), (df['Low']-pc).abs()], axis=1).max(axis=1)
@@ -204,9 +182,6 @@ def calculate_indicators(df):
     if not np.isfinite(atr_v) or atr_v <= 0: raise ValueError(f"ATR invalid: {atr_v}")
     return summ, {'close': cl, 'ema20': e20, 'ema50': e50, 'ema200': e200, 'atr': atr_s, 'cmf': cmf_s, 'rsi': rsi_s, 'squeeze': sq_s, 'volume': vol}
 
-# =============================================================================
-# FILTER & PATTERNS
-# =============================================================================
 def is_tradeable_stock(df, lc):
     if len(df) < 10: return False, "data pendek"
     if (df['Volume'].tail(3) <= 0).all(): return False, "vol 0 (suspend)"
@@ -299,17 +274,14 @@ def analyse_bandar(df, ind_s):
     if np.mean(v[-5:])>vm*1.05 and np.mean(v[-5:])<vm*1.5 and (max(c[-5:])-min(c[-5:]))/max(av,1e-9)<1.2: sigs.append({'key':'stealth_accum','style':'accum','label':'Akum. Senyap','short':'STL','conf_pct':68,'conf':'med'})
     if n>=7 and o[last]>c[-2]*1.005 and vr(last)>2.0 and (max(c[-7:-2])-min(c[-7:-2]))/max(av,1e-9)<2.0: sigs.append({'key':'markup','style':'purple','label':'Markup','short':'MRK','conf_pct':int(min(60+(vr(last)-2.0)/3.0*35,95)),'conf':'high'})
     if n>=3:
-        pd, tr = c[-2]-c[-3], c[-1]-c[-2]
-        if pd<0 and abs(pd)/max(av,1e-9)>1.5 and tr>abs(pd)*0.6 and vr(last-1)>1.5: sigs.append({'key':'shakeout','style':'warn','label':'Shakeout','short':'SKO','conf_pct':int(min(55+abs(pd)/max(av,1e-9)*8,88)),'conf':'high'})
+        pd_, tr = c[-2]-c[-3], c[-1]-c[-2]
+        if pd_<0 and abs(pd_)/max(av,1e-9)>1.5 and tr>abs(pd_)*0.6 and vr(last-1)>1.5: sigs.append({'key':'shakeout','style':'warn','label':'Shakeout','short':'SKO','conf_pct':int(min(55+abs(pd_)/max(av,1e-9)*8,88)),'conf':'high'})
     if _detect_div(df, ind_s['rsi'], 'rsi'): sigs.append(_detect_div(df, ind_s['rsi'], 'rsi'))
     if _detect_div(df, ind_s['cmf'], 'cmf'): sigs.append(_detect_div(df, ind_s['cmf'], 'cmf'))
     if _detect_trap(df): sigs.append(_detect_trap(df))
     sigs.sort(key=lambda x: x['conf_pct'], reverse=True)
     return {'signals': sigs, 'dominant': sigs[0] if sigs else None, 'narasi_tech': '', 'narasi_plain': ''}
 
-# =============================================================================
-# SCORING & RISK
-# =============================================================================
 def score_trend(i):
     a50, a20 = i['above_ema50'], i['above_ema20']
     if a50 and a20: return min(16.0 + (2.0 if i.get('ema200_ok') and i.get('above_ema200') else 0.0) + (2.0 if i.get('ema20_rising') else 0.0), 20.0), "bull"
@@ -447,9 +419,6 @@ def flag_corr_clusters(cm, th=0.7):
             if pd.notna(c) and c >= th: p.append((cm.columns[i], cm.columns[j], round(float(c),2)))
     return sorted(p, key=lambda x: -x[2])
 
-# =============================================================================
-# DOWNLOAD ENGINE
-# =============================================================================
 def download_chunk(tk, pdays, intv):
     sd = (datetime.now() - timedelta(days=pdays)).strftime('%Y-%m-%d')
     ed = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
@@ -508,9 +477,6 @@ def fetch_live_prices(tjk):
 @st.cache_data(ttl=20, show_spinner=False)
 def _cached_live(tjk_tup): return fetch_live_prices(list(tjk_tup))
 
-# =============================================================================
-# MAIN STRATEGY ENGINE
-# =============================================================================
 def quant_strategy_engine(ad, cfg, tm, ihsg=None, regime=None):
     mp = INTRADAY_PARAMS if tm == "Intraday (Fast Trade)" else SWING_PARAMS
     res, skip, all_bd = [], {}, []
@@ -552,10 +518,22 @@ def quant_strategy_engine(ad, cfg, tm, ihsg=None, regime=None):
             "RS Score": rs_sc, "RS Label": rs_lb, "Gap Risk": gr_risk['risk_label'], "Liq Impact": li['label'],
             "_ind": ind, "_vol_ctx": vc, "_tape": tp, "_bandar": bd_, "_gap_risk": gr_risk, "_liq_impact": li, "_breakdown": bd
         })
-    bc = sum(1 for b in all_bd if b.get('trend',(0,'neut'))[1]=='bull')
-    br = {'bullish_pct': round(bc/len(all_bd)*100,1) if all_bd else 0, 'total': len(all_bd), 'label': "Breadth Kuat" if bc/len(all_bd)>=0.65 if all_bd else 0 else ("Breadth Netral" if bc/len(all_bd)>=0.45 if all_bd else 0 else "Breadth Lemah")}
+    
+    # HOTFIX: Breadth calculation
+    if all_bd:
+        bull_count = sum(1 for b in all_bd if b.get('trend', (0.0, 'neut'))[1] == 'bull')
+        total_bd = len(all_bd)
+        b_pct = round(bull_count / total_bd * 100, 1)
+        if b_pct >= 65: b_lb = "Breadth Kuat (Bullish)"
+        elif b_pct >= 45: b_lb = "Breadth Netral"
+        else: b_lb = "Breadth Lemah (Bearish)"
+        br = {'bullish_pct': b_pct, 'total': total_bd, 'label': b_lb}
+    else:
+        br = {'bullish_pct': 0.0, 'total': 0, 'label': 'Tidak ada data'}
+        
     st.session_state['scan_meta'] = {'total_input': len(ad), 'lolos': len(res), 'difilter': len(skip), 'skipped': skip, 'breadth': br, 'regime': regime}
     if not res: return pd.DataFrame()
+    
     lps = _cached_live(tuple(sorted([r["_tjk"] for r in res])))
     for r in res:
         lp = lps.get(r["_tjk"])
@@ -567,10 +545,14 @@ def quant_strategy_engine(ad, cfg, tm, ihsg=None, regime=None):
             r["Risk%"] = f"-{round(max(lrr['risk_pct'],0),1)}%"
             r["Upside TP1"] = f"{'+' if lrr['up1_pct']>=0 else ''}{round(lrr['up1_pct'],1)}%"
             r["R/R TP1"] = f"1:{round(lrr['rr1'],2)}"
+            r["R/R TP2"] = f"1:{round(lrr['rr2'],2)}"
+            r["R/R TP3"] = f"1:{round(lrr['rr3'],2)}"
         else:
             r["Risk%"] = f"-{round((float(r['Buy Max'])-slf)/float(r['Buy Max'])*100,1)}%"
             r["Upside TP1"] = f"+{round((float(r['TP1'])-float(r['Buy Max']))/float(r['Buy Max'])*100,1)}%"
             r["R/R TP1"] = f"1:{round((float(r['TP1'])-float(r['Buy Max']))/max(float(r['Buy Max'])-slf,1e-6),2)}"
+            r["R/R TP2"] = f"1:{round((float(r['TP2'])-float(r['Buy Max']))/max(float(r['Buy Max'])-slf,1e-6),2)}"
+            r["R/R TP3"] = f"1:{round((float(r['TP3'])-float(r['Buy Max']))/max(float(r['Buy Max'])-slf,1e-6),2)}"
         pr = estimate_prob(r["Score"], r["Grade"], lpf, float(r["Buy Min"]), float(r["Buy Max"]), slf, float(r["TP1"]), float(r["TP2"]), float(r["TP3"]), float(r["ATR"]), r["_ind"], r["_vol_ctx"], r["_tape"], r["_bandar"])
         r.update(pr)
         del r["_tjk"]
@@ -608,9 +590,6 @@ def compute_indicator_history(df, n=10):
     rows.append({'date': df.index[-1], 'close': ind_f['last_close'], 'score': compute_total_score(ind_f)[0], 'rsi': ind_f['rsi_val'], 'cmf': ind_f['cmf_val'], 'adx': ind_f['adx_val']})
     return pd.DataFrame(rows)
 
-# =============================================================================
-# JOURNAL & BACKTEST
-# =============================================================================
 JOURNAL_COLS = ['tanggal_sinyal','ticker','mode','harga_saat_sinyal','buy_min','buy_max','stop_loss','tp1','tp2','tp3','score','grade','status','tanggal_resolusi','hari_berjalan']
 
 def _jpath():
@@ -671,9 +650,6 @@ def eval_journal(jdf):
     except: pass
     return j
 
-# =============================================================================
-# PROBABILITY & VALIDITY
-# =============================================================================
 def _check_validity(lp, sl, bmin, bmax):
     if lp <= sl * (1 - 0.015):
         return {'status':'expired','title':'⚠️ Sinyal Tidak Valid','detail':f'Harga ({fmt_num(lp)}) breakdown SL ({fmt_num(sl)}).','action':'Skip.','card_cls':'signal-expired','banner_cls':'expired-banner','title_color':'#f85149'}
@@ -738,9 +714,6 @@ def prob_label(p):
     if p>=45: return "Spekulatif"
     return "Rendah"
 
-# =============================================================================
-# BEST BUY ENGINE & CALIBRATION
-# =============================================================================
 def compute_best_buy_ev(row):
     reasons, tot = [], 0.0
     v = _check_validity(row["Live Price"], row["Stop Loss"], row["Buy Min"], row["Buy Max"])
@@ -761,8 +734,15 @@ def compute_best_buy_ev(row):
     if vc.get("valid") and vc.get("vol_ratio",0)>=1.3 and vc.get("candle_dir")=="bullish": tot += 10
     if row.get("RS Label","N/A") != "N/A":
         ra = round((row.get("RS Score",50.0)-50.0)/45.0*7.0, 1); tot += ra
+    
+    # HOTFIX: R/R parsing
+    try:
+        r1 = float(str(row["R/R TP1"]).split(":")[1])
+        r2 = float(str(row["R/R TP2"]).split(":")[1])
+        r3 = float(str(row["R/R TP3"]).split(":")[1])
+    except: r1, r2, r3 = 1.5, 2.5, 4.0
+        
     p1, p2, p3, ps = row["Prob TP1"]/100, row["Prob TP2"]/100, row["Prob TP3"]/100, row["Prob SL"]/100
-    r1, r2, r3 = float(row["R/R TP1"].split(":")[1]), float(row["R/R TP1"].split(":")[1]), float(row["R/R TP1"].split(":")[1]) # Simplified RR parse
     ev = (0.4*p1*r1) + (0.4*p2*r2) + (0.2*p3*r3) - (ps*1.0)
     return round(ev,2), round(max(min(tot,100),0),1), reasons
 
@@ -771,8 +751,8 @@ def pick_best_buy(df):
     bt, be, br = None, -99.0, []
     for _, r in df.iterrows():
         if r["Live Price"] > r["Buy Max"]: continue
-        ev, _, _ = compute_best_buy_ev(r)
-        if ev > 0 and ev > be: be, br, bt = ev, _, r["Ticker"]
+        ev, add_sc, reas = compute_best_buy_ev(r)
+        if ev > 0 and ev > be: be, br, bt = ev, reas, r["Ticker"]
     if bt is None: return None, 0.0, [], False
     return bt, be, br, True
 
@@ -790,9 +770,6 @@ def get_calibrated_probs(journal_df):
             cal[(lo, hi)] = round(len(wins) / len(bin_data) * 100, 1)
     return cal
 
-# =============================================================================
-# UI RENDERERS
-# =============================================================================
 def _pill(l, s): return f'<span class="ind-pill ind-{s}">{l}</span>'
 def _tpill(s, st, c): return f'<span class="tape-pill tape-{st}">{s} {c}%</span>'
 def _gb(g): return f'<span class="grade-{g}">Grade {g}</span>'
@@ -840,13 +817,12 @@ def render_cards(df, max_c=6, bt=None, cal_probs={}):
                 bh = f'<div class="{v["banner_cls"]}"><div style="font-size:0.78rem;font-weight:800;color:{v["title_color"]};">{v["title"]}</div><div style="font-size:0.68rem;color:#c9d1d9;">{v["detail"]}</div></div>' if v['status'] in ['expired','waiting'] else ''
                 do, dc_ = '<div class="dimmed">' if v['status']=='expired' else '<div>', '</div>'
                 
-                # Calibrated Prob Badge
                 cal_html = ""
                 if cal_probs:
                     for lo, hi in cal_probs:
                         if lo <= r["Score"] < hi:
                             actual = cal_probs[(lo,hi)]
-                            cal_html = f'<span style="font-size:0.6rem;color:#8b949e;">(Historis: {actual}%)</span>'
+                            cal_html = f'<span style="font-size:0.6rem;color:#8b949e;">(Hist: {actual}%)</span>'
                             break
 
                 html = f'<div class="metric-card {cls}">{ch}<div style="display:flex;justify-content:space-between;margin-bottom:0.3rem;"><span class="ticker">{r["Ticker"]}</span><div style="display:flex;gap:0.4rem;align-items:center;">{_gb(r["Grade"])}<span class="score-badge">Score {r["Score"]}</span></div></div><div style="margin-bottom:0.5rem;">{ph}</div>{_html_vc(r["_vol_ctx"])}{bh}{_html_ps(r["Live Price"], r["Last Price"], r["Buy Min"], r["Buy Max"], r.get("Live Src","delayed"))}{do}<div class="price-range">{fmt_num(r["Buy Min"])} – {fmt_num(r["Buy Max"])}</div><div class="label" style="margin-bottom:0.6rem;">Area Buy · ATR {r["ATR"]} {_adx_b(r["ADX"], r.get("ADX Strength","weak"), r.get("ADX Bullish",False))}</div><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0.4rem;margin-bottom:0.6rem;border-top:1px solid #30363d;padding-top:0.4rem;"><div><div class="label">TP1 <span class="rr-badge">({r["R/R TP1"]})</span></div><div class="tp">{fmt_num(r["TP1"])} <span style="font-size:0.68rem;">{r.get("Upside TP1","")}</span></div></div><div><div class="label">TP2</div><div class="tp">{fmt_num(r["TP2"])}</div></div><div><div class="label">TP3</div><div class="tp" style="color:#bc8cff;">{fmt_num(r["TP3"])}</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;margin-bottom:0.4rem;"><div><div class="label">Stop Loss</div><div class="sl">{fmt_num(r["Stop Loss"])} <span style="font-size:0.68rem;">{r["Risk%"]}</span></div></div><div><div class="label">Trailing</div><div class="ts-rule" style="font-size:0.78rem;">{r["TS Kriteria"]}</div></div></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0.35rem;margin-bottom:0.5rem;background:rgba(88,166,255,0.05);border:1px solid rgba(88,166,255,0.18);border-radius:6px;padding:0.45rem 0.5rem;"><div><div class="label">Prob Entry {cal_html}</div><div style="color:#58a6ff;font-weight:800;">{r["Prob Entry"]}%</div></div><div><div class="label">Prob TP1</div><div style="color:#3fb950;font-weight:800;">{r["Prob TP1"]}%</div></div><div><div class="label">Prob SL</div><div style="color:#f85149;font-weight:800;">{r["Prob SL"]}%</div></div></div><div style="border-top:1px solid #30363d;padding-top:0.4rem;display:grid;grid-template-columns:1fr 1fr;gap:0.3rem;font-size:0.75rem;"><div><div class="label">Lots</div><div style="color:#fff;font-weight:600">{int(r["Lots"])} Lot</div></div><div><div class="label">Alokasi</div><div style="color:#58a6ff;font-weight:600">{fmt_idr(r["Alokasi (Rp)"])}</div></div></div>{dc_}{_html_tb(r["_tape"], r["_bandar"])}</div>'
@@ -948,7 +924,6 @@ def render_bb_banner(t, ev, r):
     v = _check_validity(r["Live Price"], r["Stop Loss"], r["Buy Min"], r["Buy Max"])
     sl = "🟢 Siap entry" if v['status']=='valid' else "🟡 Pantau"
     st.markdown(f'<div class="best-buy-banner"><div style="display:flex;justify-content:space-between;"><div><span class="best-buy-crown">👑 BEST BUY</span><span style="font-size:1.5rem;font-weight:900;color:#ffd700;margin-left:0.5rem;">{t}</span><span style="font-size:0.8rem;color:#e3b341;margin-left:0.6rem;">{sl}</span></div><div style="text-align:right;"><div style="font-size:0.65rem;color:#8b949e;">EXPECTED VALUE</div><div style="font-size:1.4rem;font-weight:900;color:#ffd700;">+{ev}R</div></div></div></div>', unsafe_allow_html=True)
-    # Log to alerts.log
     try:
         with open("alerts.log", "a") as f: f.write(f"{datetime.now()}: BEST BUY {t} EV={ev}R\n")
     except: pass
@@ -967,9 +942,6 @@ def render_sector_warning(df):
     if secs.count(secs[0]) >= 3:
         st.markdown(f'<div style="background:rgba(248,81,73,0.06);border:1px solid rgba(248,81,73,0.25);border-radius:8px;padding:0.7rem 1rem;margin:1rem 0;color:#f85149;">⚠️ <b>Konsentrasi Sektor:</b> 3 dari 5 saham teratas berasal dari sektor <b>{secs[0]}</b>. Pertimbangkan diversifikasi.</div>', unsafe_allow_html=True)
 
-# =============================================================================
-# CACHING WRAPPER
-# =============================================================================
 def _hash_d(d):
     if not d: return "e"
     s = []
@@ -982,9 +954,6 @@ def _hash_d(d):
 def _cached_engine(ds, cs, tm, is_, rs_, _ad, _cfg, _ihsg, _reg):
     return quant_strategy_engine(_ad, _cfg, tm, _ihsg, _reg)
 
-# =============================================================================
-# MAIN UI
-# =============================================================================
 st.sidebar.header("⚙️ Parameter")
 theme_toggle = st.sidebar.radio("Tema", ["Dark", "Light"], index=0 if st.session_state['theme']=='dark' else 1, horizontal=True)
 if (theme_toggle.lower() != st.session_state['theme']):
@@ -1001,12 +970,11 @@ max_px = st.sidebar.number_input("Harga Max", value=25_000, step=500, min_value=
 min_sc = st.sidebar.slider("Min Score", 50, 85, 60, 5)
 cfg = {'total_capital':cap, 'capital_risk_limit_pct':rl, 'max_capital_allocation_pct':al, 'min_adtv':min_adtv, 'min_price':min_px, 'max_price':max_px, 'min_score_threshold':float(min_sc)}
 
-st.markdown("## 🧭 IDX Screener v9.0")
+st.markdown("## 🧭 IDX Screener v9.1")
 app_mode = st.radio("Mode", ["🔍 Screener", "🔬 Deep Dive", "⚖️ Bandingkan", "📓 Jurnal", "📊 Backtest"], horizontal=True)
 st.markdown("---")
 tm = st.radio("Gaya Trading", ["Swing Trading", "Intraday (Fast Trade)"], horizontal=True)
 
-# Load Journal for Calibration
 j_df = load_journal()
 cal_probs = get_calibrated_probs(j_df)
 
