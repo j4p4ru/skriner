@@ -17,10 +17,9 @@ except ImportError:
     import altair as alt
 
 # =============================================================================
-# CHANGELOG v9.2 (ROBUST FALLBACK)
+# CHANGELOG v9.4 (HASH FIX)
 # =============================================================================
-# 1. [HOTFIX] Auto-fallback ke Altair jika Plotly tidak terinstall. 
-#    Mencegah ModuleNotFoundError di Streamlit Cloud yang belum ada plotly di requirements.txt.
+# 1. [HOTFIX] Memperbaiki ValueError pada _hash_d saat menerima input DataFrame Pandas (IHSG).
 # =============================================================================
 
 SECTOR_MAP = {
@@ -36,7 +35,7 @@ SECTOR_MAP = {
     'TPIA': 'Chemical', 'BRPT': 'Energy', 'AKRA': 'Energy', 'PGAS': 'Energy',
 }
 
-st.set_page_config(page_title="Quant Trader - IDX Screener v9.2", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Quant Trader - IDX Screener v9.4", layout="wide", initial_sidebar_state="expanded")
 
 if 'theme' not in st.session_state: st.session_state['theme'] = 'dark'
 
@@ -852,11 +851,22 @@ def render_deep_dive(cfg, tm, cal_probs):
     st.markdown("### 🔬 Deep Dive")
     lf = st.session_state.get('last_final_df')
     st_tk = list(lf['Ticker']) if lf is not None and not lf.empty else []
+    
     c1, c2 = st.columns([2,2])
-    with c1: pk = st.selectbox("Dari scan:", ["--"]+st_tk) if st_tk else st.caption("Jalankan scan dulu.")
-    with c2: mt = st.text_input("Manual:", placeholder="ADRO")
-    tr = mt.strip() if mt.strip() else (pk if pk and pk!="--" else None)
-    if not tr: return
+    pk = "--"
+    with c1:
+        if st_tk:
+            pk = st.selectbox("Dari scan:", ["--"]+st_tk)
+        else:
+            st.caption("Belum ada hasil scan. Ketik manual di kanan.")
+    with c2:
+        mt = st.text_input("Manual:", placeholder="ADRO")
+        
+    tr = mt.strip() if mt.strip() else (pk if pk != "--" else "")
+    if not tr: 
+        st.info("👆 Pilih atau ketik satu kode saham untuk memulai analisa.")
+        return
+        
     tjk = tr.upper() if tr.upper().endswith(".JK") else f"{tr.upper()}.JK"
     if not st.button("🔬 Analisa", type="primary"): return
     pd_, iv = (30,"60m") if tm=="Intraday (Fast Trade)" else (400,"1d")
@@ -960,12 +970,18 @@ def render_sector_warning(df):
         st.markdown(f'<div style="background:rgba(248,81,73,0.06);border:1px solid rgba(248,81,73,0.25);border-radius:8px;padding:0.7rem 1rem;margin:1rem 0;color:#f85149;">⚠️ <b>Konsentrasi Sektor:</b> 3 dari 5 saham teratas berasal dari sektor <b>{secs[0]}</b>. Pertimbangkan diversifikasi.</div>', unsafe_allow_html=True)
 
 def _hash_d(d):
-    if not d: return "e"
-    s = []
-    for t, df in sorted(d.items()):
-        try: s.append(f"{t}:{len(df)}:{df['Close'].iloc[-1]:.2f}")
-        except: s.append(f"{t}:err")
-    return hashlib.md5("|".join(s).encode()).hexdigest()
+    if d is None: return "none"
+    if isinstance(d, pd.DataFrame):
+        try: return hashlib.md5(f"df:{len(d)}:{d['Close'].iloc[-1]:.2f}".encode()).hexdigest()
+        except: return "df_err"
+    if isinstance(d, dict):
+        if not d: return "e"
+        s = []
+        for t, df in sorted(d.items()):
+            try: s.append(f"{t}:{len(df)}:{df['Close'].iloc[-1]:.2f}")
+            except: s.append(f"{t}:err")
+        return hashlib.md5("|".join(s).encode()).hexdigest()
+    return "unknown"
 
 @st.cache_data(ttl=300, show_spinner=False, max_entries=5)
 def _cached_engine(ds, cs, tm, is_, rs_, _ad, _cfg, _ihsg, _reg):
@@ -987,7 +1003,7 @@ max_px = st.sidebar.number_input("Harga Max", value=25_000, step=500, min_value=
 min_sc = st.sidebar.slider("Min Score", 50, 85, 60, 5)
 cfg = {'total_capital':cap, 'capital_risk_limit_pct':rl, 'max_capital_allocation_pct':al, 'min_adtv':min_adtv, 'min_price':min_px, 'max_price':max_px, 'min_score_threshold':float(min_sc)}
 
-st.markdown("## 🧭 IDX Screener v9.2")
+st.markdown("## 🧭 IDX Screener v9.4")
 app_mode = st.radio("Mode", ["🔍 Screener", "🔬 Deep Dive", "⚖️ Bandingkan", "📓 Jurnal", "📊 Backtest"], horizontal=True)
 st.markdown("---")
 tm = st.radio("Gaya Trading", ["Swing Trading", "Intraday (Fast Trade)"], horizontal=True)
