@@ -17,12 +17,14 @@ except ImportError:
     import altair as alt
 
 # =============================================================================
-# CHANGELOG v10.0 (DEEP DIVE OVERHAUL)
+# CHANGELOG v10.1 (BUGFIX)
 # =============================================================================
-# 1. [UI] Deep Dive kini menampilkan Live Probability (Prob Entry, TP1, SL).
-# 2. [UI] Deep Dive menampilkan Score History (10 hari) untuk lihat tren momentum.
-# 3. [UI] Deep Dive menampilkan Risk Context (Gap Risk, Liq Impact, RS vs IHSG).
-# 4. [UI] Deep Dive menampilkan Volume Context & Narasi Bandarmology lengkap.
+# 1. [FIX] TypeError pada render_deep_dive: argumen n_days diubah ke n sesuai 
+#    definisi fungsi compute_indicator_history.
+# 2. [UI] Deep Dive kini menampilkan Live Probability (Prob Entry, TP1, SL).
+# 3. [UI] Deep Dive menampilkan Score History (10 hari) untuk lihat tren momentum.
+# 4. [UI] Deep Dive menampilkan Risk Context (Gap Risk, Liq Impact, RS vs IHSG).
+# 5. [UI] Deep Dive menampilkan Volume Context & Narasi Bandarmology lengkap.
 # =============================================================================
 
 SECTOR_MAP = {
@@ -38,7 +40,7 @@ SECTOR_MAP = {
     'TPIA': 'Chemical', 'BRPT': 'Energy', 'AKRA': 'Energy', 'PGAS': 'Energy',
 }
 
-st.set_page_config(page_title="Quant Trader - IDX Screener v10.0", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Quant Trader - IDX Screener v10.1", layout="wide", initial_sidebar_state="expanded")
 
 if 'theme' not in st.session_state: st.session_state['theme'] = 'dark'
 
@@ -948,7 +950,7 @@ def render_deep_dive(cfg, tm, cal_probs, ihsg):
         st.markdown(f"**Trailing:** {pl['ts_rule']}  \n**Partial Exit:** {pl['partial_plan']}")
         
         st.markdown("#### 📊 Tren Score (10 Hari)")
-        _render_score_hist(compute_indicator_history(df, n_days=10))
+        _render_score_hist(compute_indicator_history(df, n=10))
         
     with cB:
         st.markdown("#### 🎯 Live Probability & Risk")
@@ -1091,7 +1093,7 @@ max_px = st.sidebar.number_input("Harga Max", value=25_000, step=500, min_value=
 min_sc = st.sidebar.slider("Min Score", 50, 85, 60, 5)
 cfg = {'total_capital':cap, 'capital_risk_limit_pct':rl, 'max_capital_allocation_pct':al, 'min_adtv':min_adtv, 'min_price':min_px, 'max_price':max_px, 'min_score_threshold':float(min_sc)}
 
-st.markdown("## 🧭 IDX Screener v10.0")
+st.markdown("## 🧭 IDX Screener v10.1")
 app_mode = st.radio("Mode", ["🔍 Screener", "🔬 Deep Dive", "⚖️ Bandingkan", "📓 Jurnal", "📊 Backtest"], horizontal=True)
 st.markdown("---")
 tm = st.radio("Gaya Trading", ["Swing Trading", "Intraday (Fast Trade)"], horizontal=True)
